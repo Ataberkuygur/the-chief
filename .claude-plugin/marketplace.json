@@ -1,0 +1,8 @@
+{
+  "name": "the-chief",
+  "owner": { "name": "Ataberk Uygur" },
+  "description": "The Chief: run a team of AI agents from Claude Code",
+  "plugins": [
+    { "name": "the-chief", "source": "./", "description": "The Chief 1.43.12" }
+  ]
+}
