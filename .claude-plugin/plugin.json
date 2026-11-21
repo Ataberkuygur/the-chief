@@ -1,6 +1,6 @@
 {
   "name": "the-chief",
-  "version": "1.43.12",
+  "version": "1.43.16",
   "description": "The Chief: run agent squads from inside Claude Code. Per-task lanes (CLI, model, effort, agent count), a live view of every agent and subagent with stop and follow-up, Sonnet overviews kept by date with a day-end summary, and goals you start as /goal.",
   "author": {
     "name": "Ataberk Uygur"
@@ -21,7 +21,95 @@
       "title": "Language",
       "description": "auto (default): Turkish when Claude Code's language setting or the system is Turkish, else English. en or tr fixes it.",
       "default": "auto",
-      "options": ["auto", "en", "tr"]
+      "options": [
+        "auto",
+        "en",
+        "tr"
+      ]
+    },
+    "simple_mode": {
+      "type": "string",
+      "title": "Simple mode",
+      "description": "On: the fine-tuning options below are read as their defaults, whatever is saved (compact and read guards, handoff, wake guard, heavy command gate, stale locks, agents across all chats, allowed worker models, subagent routes, release of finished chiefs). Keys, models, tiers, permissions and money options are never touched. Off: every option is used as saved.",
+      "default": "off",
+      "options": [
+        "off",
+        "on"
+      ]
+    },
+    "chief_work": {
+      "type": "string",
+      "title": "How chiefs work",
+      "description": "either (default): each chief decides per piece whether to do it itself or hand it to workers. self: chiefs do the job themselves and start no workers. delegate: chiefs only split the job and hand it to workers. The leader can still say otherwise for one chief.",
+      "default": "either",
+      "options": [
+        "either",
+        "self",
+        "delegate"
+      ]
+    },
+    "auto_pin": {
+      "type": "string",
+      "title": "Pin chats automatically",
+      "description": "off (default): The Chief never pins or unpins a chat by itself. on: a chat that does real work is pinned, and unpinned again when it sits idle.",
+      "default": "off",
+      "options": [
+        "off",
+        "on"
+      ]
+    },
+    "auto_title": {
+      "type": "string",
+      "title": "Name chats automatically",
+      "description": "off (default): The Chief never renames a chat by itself; a title you or the leader give stays. on: a chat is named once after its first request or goal.",
+      "default": "off",
+      "options": [
+        "off",
+        "on"
+      ]
+    },
+    "show_row": {
+      "type": "string",
+      "title": "Row above the chat",
+      "description": "on (default): The Chief's one row above the chat box (The Chief button and running agents). off: the row is hidden for good; everything else keeps working. /chief-row off and /chief-row on change it too.",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
+    "chief_remote_control": {
+      "type": "string",
+      "title": "Remote Control",
+      "description": "off (default): The Chief never turns Remote Control on by itself. on: every working chat turns its Remote Control on, so you can follow it from your phone.",
+      "default": "off",
+      "options": [
+        "off",
+        "on"
+      ]
+    },
+    "health_check": {
+      "type": "string",
+      "title": "CLI health check",
+      "description": "auto: once a day each installed, signed-in agent CLI says one word on a small model, so a broken sign-in, key or empty credit shows before a job lands on it (it is taken out of the routes and you are told the fix). logins: only the free sign-in status, no test run. off: nothing runs by itself. /chief-check and the Settings button always test now.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "logins",
+        "off"
+      ]
+    },
+    "max_parallel": {
+      "type": "string",
+      "title": "Agents at once",
+      "description": "At most this many headless agents run together; more wait in the queue. Launches also wait while less than the RAM reserve (ram_reserve_gb) would be left.",
+      "default": "10"
+    },
+    "ram_reserve_gb": {
+      "type": "string",
+      "title": "RAM kept free (GB)",
+      "description": "New agents wait in the queue while launching them would leave less than this much available RAM. Agents grow after they start, so the machine stays responsive. Default 3.",
+      "default": "3"
     },
     "anthropic_api_key": {
       "type": "string",
@@ -215,18 +303,6 @@
         "cpu"
       ]
     },
-    "max_parallel": {
-      "type": "string",
-      "title": "Agents at once",
-      "description": "At most this many headless agents run together; more wait in the queue. Launches also wait while less than the RAM reserve (ram_reserve_gb) would be left.",
-      "default": "10"
-    },
-    "ram_reserve_gb": {
-      "type": "string",
-      "title": "RAM kept free (GB)",
-      "description": "New agents wait in the queue while launching them would leave less than this much available RAM. Agents grow after they start, so the machine stays responsive. Default 3.",
-      "default": "3"
-    },
     "dev_source": {
       "type": "string",
       "title": "Hot-reload source",
@@ -288,7 +364,7 @@
     "heavy_gate": {
       "type": "string",
       "title": "Heavy command gate",
-      "description": "on (default): heavy commands (tsc, vitest, dependency-cruiser) started by agents are held machine-wide (never ones you start in your own terminal), when the free RAM has no slot for them: the newest is paused and goes on, oldest first, when one ends (slots = (free RAM + RAM they hold − reserve) / 3.5 GB, 1-4). A command paused 30 minutes goes on anyway. Under 1.8 GB free one heavy tree a step is ended (the newest vitest first; never ffmpeg, never the last build). off: no gate.",
+      "description": "on (default): heavy commands (tsc, vitest, dependency-cruiser, ffmpeg) are held machine-wide, whoever started them, when the free RAM has no slot for them: the newest is paused and goes on, oldest first, when one ends (slots = (free RAM + RAM they hold − reserve) / 3.5 GB, 1-4). A command paused 30 minutes goes on anyway. Under 1.8 GB free one heavy tree a step is ended (the newest vitest first; never ffmpeg, never the last build). off: no gate.",
       "default": "on"
     },
     "subagent_tiers": {
@@ -373,16 +449,6 @@
       "title": "Chrome tab bridge",
       "description": "off (default): agents never use your Chrome. on: The Chief installs its bundled bridge (in ~/.the-chief/tab-bridge, or LOCALAPPDATA/the-chief/tab-bridge on Windows) and tells agents to drive your real Chrome through it, including sites where you are signed in. Or a folder path to your own copy (tb.js + start-bridge). First time: chrome://extensions, Developer mode, Load unpacked, the ext folder inside it.",
       "default": "off"
-    },
-    "chief_remote_control": {
-      "type": "string",
-      "title": "Remote Control",
-      "description": "off (default): The Chief never turns Remote Control on by itself. on: every working chat turns its Remote Control on, so you can follow it from your phone.",
-      "default": "off",
-      "options": [
-        "off",
-        "on"
-      ]
     },
     "api_credit_fallback": {
       "type": "string",

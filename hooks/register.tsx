@@ -1,4 +1,5 @@
 import { atom, read, update } from 'claude-code'
+import { register as registerThemes, startTheme, themesTab } from './themes'
 import type { EngineInterface, FsEntry, Register } from 'claude-code'
 
 import type { SquadBudget, SquadCli, SquadGoal, SquadLane, SquadLimit, SquadReport, SquadSub, SquadSubControl, SquadTab, SquadWorker } from '../types'
@@ -21,18 +22,21 @@ import type { CheckResult, Credit, LaneState, LaneTemplate } from './lanes'
 import { collectZen, emptyZen, healthyZenIds, zenDue, zenTrusted } from './zen'
 import type { ZenRecord, ZenResponse } from './zen'
 import { bootGateLive, criticalKill, gatePlan, suspendPs } from './heavygate'
+import { pruneStore, storeSet } from './storekeep'
 import type { GateWait } from './heavygate'
 import { PROCSNAP_CS, PROCSNAP_VERSION, parseSnap, parseTasklist } from './procsnap'
 import type { SnapProc } from './procsnap'
 import { alarmDue, alarmKey, CPU_ACTIVE_MS, parseCpuTime, promptFile, resultReport, stateLabel, workerHealth, workerRow } from './workerhealth'
 import { SETUP_KEY, setupInfo, canAskSetup, riskyOn, runSetup } from './setup'
 import { L, firstAppleLanguage, getLang, pickLang, setLang } from './lang'
-import { APP, archiveSession, cleanTitle, handoffArchiveOk, handoffVerdict, hasDone, idleCompactDue, logAction, nameOnce, nameSession, parseCompactLimit, parseHours, patchSess, pinSession, readSess, recordCompact, remoteOn, renameSession, stateOf, resumeHandoff, runHandoff, titleFromText, titleOfSession } from './handoff'
+import { APP, archiveSession, knowAsk, knowPath, cleanTitle, handoffArchiveOk, handoffVerdict, hasDone, idleCompactDue, logAction, nameOnce, nameSession, parseCompactLimit, parseHours, patchSess, pinSession, readSess, recordCompact, remoteOn, renameSession, stateOf, resumeHandoff, runHandoff, titleFromText, titleOfSession } from './handoff'
 import { briefIsNew, effortReport, effortState, notMyChief, restartsChief } from './chiefs'
 import type { EffortCard, EffortState } from './chiefs'
 import type { FlowPorts, Inbound, Job as HandoffJob, Ports } from './handoff'
 import { CONSULTANTS_DEFAULT, CONSULT_BIN, CONSULT_PANEL_MAX, CONSULT_TIMEOUT_MS, LOGIN, cleanAnswer, consultArgv, consultFailure, consultPrompt, consultantName, loginVerdict, newClaudeArgv, openArgv, parseConsultants, pickConsultants, platformOf, terminalArgv } from './consult'
 import type { Consultant } from './consult'
+import { checkFiles, claimedPaths, pingArgv, pingModel, pingVerdict, simpleOpt } from './quality'
+import type { PingVerdict } from './quality'
 
 export { WAITING_RE, priceOf, stepUsd }
 /** Worker health lives in its own module (pure, tested) and is re-exported for the tests and callers that always had it here. */
@@ -68,7 +72,7 @@ const editingAtom = atom(EDITING, null)
 const savedKeysAtom = atom(SAVED_KEYS, [])
 const subControlAtom = atom(SUB_CONTROL, { model: 'auto', effort: 0 })
 const BUDGET = { plugin: 'the-chief', key: 'budget' } as const
-/** Measured once against real usage: 1% of the 5h limit ≈ $10.5 of API-priced use, 1% of the week ≈ $39.5. */
+/** Measured on this machine (Oct 1 window vs. its logs): 1% of the 5h limit ≈ $10.5 of API-priced use, 1% of the week ≈ $39.5. */
 const PRIOR_PER_USD = { five: 0.0954, week: 0.0253 } as const
 const budgetAtom = atom(BUDGET, { five: null, week: null, savedUsd: 0, savedTokens: 0, fivePerUsd: PRIOR_PER_USD.five, weekPerUsd: PRIOR_PER_USD.week, compacts: 0, reads: 0 } as SquadBudget)
 
@@ -95,7 +99,7 @@ let bandControls = false
 async function setSubControl($: $T, patch: Partial<SquadSubControl>) {
   subControl = { ...subControl, ...patch }
   await $.state.set(SUB_CONTROL, subControl)
-  await $.store.set('subControl', subControl)
+  await storeSet($, 'subControl', subControl)
 }
 const subModelText = (v: string) => SUB_MODELS.find(m => m.value === v)?.text ?? v
 const subEffortText = (n: number) => (n === 0 ? 'auto' : EFFORTS[n - 1] ?? 'auto')
@@ -146,7 +150,12 @@ const claudeWorkerMode = () => (['acceptEdits', 'bypassPermissions', 'auto', 'de
 
 /** Options saved from inside The Chief win over the host's copy until the host catches up. */
 let optOverrides: Record<string, string> = {}
-const opt = (field: string) => (field in optOverrides ? optOverrides[field]!.trim() : typeof opts[field] === 'string' ? (opts[field] as string).trim() : '')
+const savedOpt = (field: string) => (field in optOverrides ? optOverrides[field]!.trim() : typeof opts[field] === 'string' ? (opts[field] as string).trim() : '')
+/** An option as The Chief reads it: with simple_mode on, the fine-tuning ones are their defaults whatever is saved. */
+const opt = (field: string) => simpleOpt(field, savedOpt(field), savedOpt('simple_mode') === 'on')
+/** The Chief pins chats, or names them, by itself only when the owner turned that on; asked-for pins and titles always work. */
+const autoPin = () => opt('auto_pin') === 'on'
+const autoTitle = () => opt('auto_title') === 'on'
 export const budget = (): BudgetOptions => ({
   guardTokens: parseTokens(opt('context_guard'), 300_000),
   coldMs: COLD_MS,
@@ -554,7 +563,7 @@ async function registerChiefTools($: $T) {
     await registerTool($, {
       name: 'spawn_worker',
       description:
-        'Start one headless agent from the Squad pane. Give it a name, a brief file it must read and execute, and how hard the job is as tier (cok_zor|zor|orta|kolay: the owner\'s Alt ajan seviyeleri set CLI, model and effort; a difficulty floor can lift it), or a lane id from the Squad plan, or cli/model/effort directly. With saved tiers and none of those, the tier is orta. Returns at once; you are told when the agent finishes.',
+        'Start one headless agent from the Squad pane. Give it a name, a brief file it must read and execute, and how hard the job is as tier (cok_zor|zor|orta|kolay: the owner\'s Alt ajan seviyeleri set CLI, model and effort; a difficulty floor can lift it), or a lane id from the Squad plan, or cli/model/effort directly. With saved tiers and none of those, the tier is orta. Returns at once and you are told when the agent finishes; with wait:true the call holds until it finishes and returns its report, like a subagent.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -582,6 +591,8 @@ async function registerChiefTools($: $T) {
           },
           detach: { type: 'boolean', description: 'Run outside the app so an app restart does not kill it (default true for Devin, Claude and Codex)' },
           permission_mode: { type: 'string', enum: ['acceptEdits', 'bypassPermissions', 'auto', 'default', 'plan'], description: 'Claude workers: acceptEdits (default) edits files; commands needing approval are refused. bypassPermissions allows everything.' },
+          wait: { type: 'boolean', description: "Hold this call until the agent finishes and return its report and last lines, as a subagent's answer comes back (up to wait_minutes; after that you are told when it ends, as without wait). Use it when you need the result to go on; leave it out to keep working meanwhile." },
+          wait_minutes: { type: 'number', description: 'With wait: how long to hold the call, 1 to 15, default 10' },
           queue: { type: 'boolean', description: 'Line it up instead of starting it now (when a worker of this chat runs): it starts by itself the moment one of your workers ends, without waiting for your turn. Queue your next briefs this way so no slot sits empty.' },
         },
         required: ['name'],
@@ -661,6 +672,8 @@ async function registerChiefTools($: $T) {
       tier: { type: 'string', enum: [...TIER_IDS], description: "How hard the chief's job is: cok_zor, zor, orta or kolay. The plugin sets the chief's model and effort from the owner's Şef seviyeleri; a difficulty floor can lift it for video, edit, upwork and similar jobs. Wins over model and effort." },
       model: { type: 'string', description: "Only when you give no tier: the chief chat's model. Left out, the chief runs at the Orta tier." },
       effort: { ...effortEnum, description: "The chief chat's own effort" },
+      work: { type: 'string', enum: [...WORK_MODES], description: "How the chief works: self = it does the job itself and starts no workers; delegate = it only splits the job and hands it to workers; either (default) = its own call for each piece. Yours (or the owner's) to decide per job." },
+      check: { type: 'string', description: "A shell command that must exit 0 before this chief's DONE counts, run in its folder when it says DONE: the project's tests or build (\"npm test\"). Optional; an empty string takes it away. Without it The Chief still checks that every file the DONE names exists and that no agent of the chief still runs." },
       subagents: {
         type: 'object',
         description: "The chief's Claude subagents",
@@ -676,7 +689,7 @@ async function registerChiefTools($: $T) {
     }
     const chiefRef = { chief: { type: 'string', description: 'The chief: its project name or the first characters of its session id, as list_chiefs shows' } }
     await registerTool($, { name: 'list_chiefs', description: 'Leader of Chiefs: every chief chat you lead (goal, model, effort, settings, what its agents are doing, its last brief) and the open chats you could adopt.', inputSchema: { type: 'object', properties: {} } })
-    await registerTool($, { name: 'create_chief', description: 'Leader of Chiefs: open a new chat as your chief, with its goal and, if you choose, its model, effort, subagents and CLI lanes, and its automatic handoff and idle compact.', inputSchema: { type: 'object', properties: { ...chiefProps, folder: { type: 'string', description: "The chief's working folder; this chat's when absent" }, title: { type: 'string', description: "The chat's title; a title you give is final, the plugin never renames it" } }, required: ['goal'] } })
+    await registerTool($, { name: 'create_chief', description: 'Leader of Chiefs: open a new chat as your chief, with its goal and, if you choose, its model, effort, subagents and CLI lanes, and its automatic handoff and idle compact.', inputSchema: { type: 'object', properties: { ...chiefProps, folder: { type: 'string', description: "The chief's working folder; this chat's when absent" }, title: { type: 'string', description: "The chat's title; a title you give is final, the plugin never renames it" }, link: { type: 'boolean', description: 'true: skip the app session and open the chief the older way (a boot turn of the claude CLI, else a /chief join link). Only after the app session route failed.' } }, required: ['goal'] } })
     await registerTool($, { name: 'adopt_chief', description: 'Leader of Chiefs: take an open chat (from list_chiefs) as your chief, optionally with settings.', inputSchema: { type: 'object', properties: { ...chiefRef, ...chiefProps }, required: ['chief'] } })
     await registerTool($, { name: 'configure_chief', description: "Leader of Chiefs: change a chief's goal, model, effort, subagents, CLI lanes, handoff or compact; only the fields you give change. An effort is read back from the chief's card and reported (a mismatch is re-applied once, then said plainly). stop: true stops the chief for good.", inputSchema: { type: 'object', properties: { ...chiefRef, ...chiefProps, clear_goal: { type: 'boolean', description: "End this chief's /goal loop now (the owner cannot). Do it when it keeps repeating itself (The Chief only reports a repeat, it never clears the goal for one) or its job is done." }, stop: { type: 'boolean', description: "true: stop this chief for good (its queued messages are emptied; nothing the plugin sends starts it again until you message it or give it a goal). false: let a stopped chief run again." } }, required: ['chief'] } })
     await registerTool($, { name: 'message_chief', description: "Leader of Chiefs: tell a chief something; it arrives in that chat as a message from you. chief = its short code, its session id (local_...), its name, or 'all' for every live chief. A Remote Control chat on another laptop (list_chiefs shows them under 'other machines') is reached by the id in brackets or its name. A stopped chief runs again when you message it.", inputSchema: { type: 'object', properties: { ...chiefRef, text: { type: 'string', description: 'The message for the chief (also accepted as message)' }, message: { type: 'string', description: 'Alias for text' } }, required: ['chief'] } })
@@ -751,7 +764,7 @@ async function stampDay($: $T) {
     if (dayStamps[today] !== undefined) return
     const known = Object.keys(dayStamps).length > 0
     dayStamps = { ...dayStamps, [today]: known ? (await $.session.messages()).length : 0 }
-    await $.store.set(`dayStamps:${sid}`, dayStamps)
+    await storeSet($, `dayStamps:${sid}`, dayStamps)
   } catch {
     // without a stamp, today reads from the session's start
   }
@@ -804,8 +817,11 @@ type Job =
   | { kind: 'goal'; text: string }
   | { kind: 'consult'; question: string; panel?: boolean }
   | { kind: 'logins' }
+  | { kind: 'health'; force?: boolean }
+  | { kind: 'done-check'; line: string; ok: string[] }
   | { kind: 'login'; cli: SquadCli }
   | { kind: 'handoff' }
+  | { kind: 'know' }
 /** Every message The Chief writes into this chat passes here: one per 30 s, never the same text twice in 10 min, at most 20 an hour, and none after /chief quiet. */
 let quiet = false
 const sentLog: { at: number; text: string }[] = []
@@ -843,7 +859,7 @@ function enqueue(job: Job) {
 
 async function save($: $T, key: 'lanes' | 'goals', value: unknown) {
   try {
-    await $.store.set(key, value)
+    await storeSet($, key, value)
   } catch {
     // keeping the pane working matters more than persisting one edit
   }
@@ -898,14 +914,14 @@ async function wantOverview($: $T, job: Extract<Job, { kind: 'overview' }>) {
   if (role === 'chief') return enqueue(job)
   if (pendingOverviews.some(j => j.report === job.report && j.day === job.day)) return
   pendingOverviews = [...pendingOverviews, job]
-  await $.store.set(`pendingOverviews:${sid}`, pendingOverviews)
+  await storeSet($, `pendingOverviews:${sid}`, pendingOverviews)
 }
 /** Writes the waiting overviews; called when the Overview tab shows. */
 function takePendingOverviews($: $T) {
   if (pendingOverviews.length === 0) return
   const jobs = pendingOverviews
   pendingOverviews = []
-  void $.store.set(`pendingOverviews:${sid}`, []).catch(() => undefined)
+  void storeSet($, `pendingOverviews:${sid}`, []).catch(() => undefined)
   for (const j of jobs) enqueue(j)
 }
 
@@ -1064,13 +1080,22 @@ async function launch($: $T, ids: readonly string[] | null, fromCommand = false)
  * until its condition holds, and a job only the owner or a file can finish loops forever (and the owner cannot close it).
  */
 /** The standing rule every chief's goal carries. */
-export const CHIEF_RULE = 'RULE (The Chief): you are the chief, you do not write code yourself; you split the work and hand it out. For every job run sub-agents of every CLI in parallel and continuously with spawn_worker (tier by difficulty), keep several running at once, line up the next briefs with spawn_worker queue:true (each starts by itself the moment a worker ends, so no slot waits for your turn), then check their results. Never push to a git remote unless the owner asked for it. Never start an agent CLI (opencode, qodercli, codex, devin…) from a shell, and do not open sub-agents with the Agent tool of Claude: give the work to mcp__the-chief__spawn_worker with a tier (kolay/orta/zor/cok_zor), so the Qoder, Longcat and DeepSeek routes run and the output stays readable with agent_output. Do not do code work yourself: give it to a DeepSeek v4.1 flash worker (spawn_worker); if a worker will not start, tell the leader at once.'
+export const CHIEF_RULE = 'RULE (The Chief): you are the chief, you do not write code yourself; you split the work and hand it out. For every job run sub-agents of every CLI in parallel and continuously with spawn_worker (tier by difficulty), keep several running at once, line up the next briefs with spawn_worker queue:true (each starts by itself the moment a worker ends, so no slot waits for your turn), then check their results. Never push to a git remote unless the owner asked for it. Never start an agent CLI (opencode, qodercli, codex, devin…) from a shell, and do not open sub-agents with the Agent tool of Claude: give the work to mcp__the-chief__spawn_worker with a tier (kolay/orta/zor/cok_zor), so the Qoder, Longcat and DeepSeek routes run and the output stays readable with agent_output. For the person\'s real Chrome use the Tab Bridge that The Chief installs (tb.js and start-bridge.ps1; the folder is in every worker prompt and in the message you get when you try Claude in Chrome), never Claude in Chrome. Do not do code work yourself: give it to a DeepSeek v4.1 flash worker (spawn_worker); if a worker will not start, tell the leader at once.'
+/** How a chief gets its job done: by itself, by handing it out, or its own call per piece. The leader (work on create_chief / configure_chief) or the owner (chief_work) says which. */
+export const WORK_MODES = ['either', 'self', 'delegate'] as const
+export type WorkMode = (typeof WORK_MODES)[number]
+const CHIEF_COMMON = "Never push to a git remote unless the owner asked for it. Never start an agent CLI (opencode, qodercli, codex, devin…) from a shell: work you hand out goes to mcp__the-chief__spawn_worker with a tier (kolay/orta/zor/cok_zor), so the routes run and the output stays readable with agent_output; when you need a worker's answer to go on, start it with wait:true and the call returns its report like a subagent's. For the person's real Chrome use the Tab Bridge that The Chief installs (tb.js and start-bridge.ps1; the folder is in every worker prompt and in the message you get when you try Claude in Chrome), never Claude in Chrome."
+/** The standing rule a chief gets with its goal, by work mode (delegate is the rule every chief had before 1.43.9). */
+export function chiefRule(work?: string): string {
+  const mode = (WORK_MODES as readonly string[]).includes(work ?? '') ? work : (WORK_MODES as readonly string[]).includes(opt('chief_work')) ? opt('chief_work') : 'either'
+  if (mode === 'delegate') return CHIEF_RULE
+  if (mode === 'self') return `RULE (The Chief): you are the chief and you do this job yourself, in this chat. Do not start workers or sub-agents for it unless the leader or the owner asks. ${CHIEF_COMMON}`
+  return `RULE (The Chief): you are the chief; how each piece gets done is your call. Do it yourself when it is small, leans on this chat's context or is faster that way; hand pieces that stand on their own to workers (spawn_worker, tier by difficulty), several at once when they do not touch the same files, and check what they return. ${CHIEF_COMMON}`
+}
 /** A chief's goal message: the goal, the DONE protocol and the standing rule. */
-export const chiefGoalMessage = (text: string) => `${goalMessage(text)}
+export const chiefGoalMessage = (text: string, work?: string) => `${goalMessage(text)}
 
-${CHIEF_RULE}${bridgeOn() ? ` ${CHIEF_BROWSER_RULE}` : ''}`
-/** Only when the owner turned the Tab Bridge on: a chief told "never Claude in Chrome" with no bridge has no browser at all. */
-export const CHIEF_BROWSER_RULE = 'For the person\'s real Chrome use the Tab Bridge that The Chief installs (the folder and start command are in every worker prompt and in the message you get when you try Claude in Chrome). If its start command says the Chrome extension is not connected, use any other browser tool you have and tell the owner the one-time setup it printed.'
+${chiefRule(work)}`
 
 export function goalMessage(text: string): string {
   return `Goal: ${text}
@@ -1150,7 +1175,7 @@ async function makeOverview($: $T, kind: SquadReport['kind'], day?: string, scop
   await $.state.set(OPEN_REPORT, null)
   await $.state.set(SUMMARIZING, false)
   try {
-    await $.store.set('reports', (await $.state.get(REPORTS)).value ?? [])
+    await storeSet($, 'reports', (await $.state.get(REPORTS)).value ?? [])
   } catch {
     // the report still shows for this session
   }
@@ -1161,7 +1186,7 @@ async function makeOverview($: $T, kind: SquadReport['kind'], day?: string, scop
 async function removeReport($: $T, id: string) {
   await update($, reports, list => (list ?? []).filter(r => r.id !== id))
   try {
-    await $.store.set('reports', (await $.state.get(REPORTS)).value ?? [])
+    await storeSet($, 'reports', (await $.state.get(REPORTS)).value ?? [])
   } catch {
     // gone from this session at least
   }
@@ -1322,7 +1347,7 @@ async function ensureVulkan($: $T, dir: string) {
 
 /**
  * A discrete GPU with room for the model. Integrated graphics are skipped: they share the system RAM
- * this is meant to save. Measured on a laptop GPU: 0.4 s and 0.35 s of CPU per status line
+ * this is meant to save. Measured on an RTX 5070 Laptop: 0.4 s and 0.35 s of CPU per status line
  * (CPU-only: 3 s and 17-20 s), 660 MB of RAM instead of 1.9 GB, 1.4 GB of VRAM; asleep, 160 MB and 126 MB.
  */
 async function pickGpu($: $T, dir: string): Promise<{ exe: string; device: string; name: string } | null> {
@@ -1355,7 +1380,7 @@ async function findServer($: $T, dir: string): Promise<string | null> {
 }
 
 /**
- * The server's flags, measured on Qwen3.5 2B (a 24-thread laptop CPU), against the defaults:
+ * The server's flags, measured on Qwen3.5 2B (i7-14650HX, 24 threads), against the defaults:
  * - 4 generation / 8 prompt threads: 18.6 s CPU per status line instead of 49.8 s, and faster (3.0 s vs 5.4 s);
  *   every core spinning only fights the person's own work.
  * - one slot, 2048 context, no prompt RAM cache, 2 checkpoints: no memory for requests that never come
@@ -1440,7 +1465,7 @@ async function ensureLocalModel($: $T) {
   if (last?.failedAt && now - last.failedAt < 10 * 60000) return
   const step = async (text: string) => {
     localSetup = { ...localSetup, step: text }
-    await $.store.set('localSetup', { beat: await $.clock.now() })
+    await storeSet($, 'localSetup', { beat: await $.clock.now() })
     await update($, tick, n => (n ?? 0) + 1)
   }
   localSetup = { step: 'Setting up the local model…', isBusy: true, isDone: false }
@@ -1473,10 +1498,10 @@ async function ensureLocalModel($: $T) {
     if (!(await startOwnServer($, server, modelPath, dir))) throw new Error('the model server did not start')
     localSeen = null
     localSetup = { step: `${model.label} ready: status lines are written on this computer, free and offline.`, isBusy: false, isDone: true }
-    await $.store.set('localSetup', { doneAt: await $.clock.now() })
+    await storeSet($, 'localSetup', { doneAt: await $.clock.now() })
   } catch (err) {
     localSetup = { step: `Local model not ready: ${err instanceof Error ? err.message : String(err)}. Lines come from the agents' events meanwhile; tried again in 10 minutes.`, isBusy: false, isDone: false }
-    await $.store.set('localSetup', { failedAt: await $.clock.now() })
+    await storeSet($, 'localSetup', { failedAt: await $.clock.now() })
   }
   await update($, tick, n => (n ?? 0) + 1)
 }
@@ -1644,13 +1669,9 @@ async function bridgeDirOf($: $T): Promise<string> {
   return dir
 }
 const bridgeOn = () => riskyOn('tab_bridge', opt('tab_bridge'))
-/** The bridge's start command on this machine. */
-const bridgeStartCmd = (dir: string, win: boolean) => (win ? `powershell -ExecutionPolicy Bypass -File ${dir}/start-bridge.ps1` : `bash ${dir}/start-bridge.sh`)
-/** The one-time step only the person can do: Chrome lets no program install an extension by itself. */
-export const bridgeSetup = (dir: string) => `chrome://extensions → Developer mode → Load unpacked → ${dir}/ext`
 /** What an agent is told about the browser: the bridge's start line and commands. */
-export const bridgeNote = (dir: string, win: boolean) =>
-  `Browser: for the person's real Chrome (their open tabs and signed-in sites) use the Tab Bridge, not Claude in Chrome (mcp__claude-in-chrome__*). Start it (safe to repeat; port 8765 belongs to it): ${bridgeStartCmd(dir, win)}, which must print "OK: Chrome extension connected.". Then: node ${dir}/tb.js tabs [filter] | eval <tabId> "<js>" | newtab <url> | nav <tabId> <url> | activate <tabId> | shot <tabId> out.png | dl <url> | pause-media. If it says the extension is NOT connected, the person has not done the one-time setup (${bridgeSetup(dir)}): tell them that, and meanwhile use any other browser tool you have.`
+export const bridgeNote = (dir: string) =>
+  `Browser: for the person's real Chrome (their open tabs and signed-in sites) use the Tab Bridge, never Claude in Chrome (mcp__claude-in-chrome__*). Start it (safe to repeat; port 8765 belongs to it): powershell -ExecutionPolicy Bypass -File ${dir}/start-bridge.ps1, which must print "OK: Chrome extension connected.". Then: node ${dir}/tb.js tabs [filter] | eval <tabId> "<js>" | newtab <url> | nav <tabId> <url> | activate <tabId> | shot <tabId> out.png | dl <url> | pause-media.`
 /** Jobs that touch a browser start the bridge for the agent. */
 export const BROWSER_JOB = /\b(chrome|browser|tabs?|drive|gmail|youtube|upwork|sekme|tarayıcı|login|giriş)\b/i
 let bridgeAt = 0
@@ -1658,25 +1679,11 @@ let opencodeNext = 0
 /** Starts the bridge once in a while (the script is idempotent and frees port 8765 itself); returns its last line. */
 async function ensureBridge($: $T): Promise<string> {
   const now = await $.clock.now()
-  if (!bridgeOn() || now - bridgeAt < 10 * 60000) return ''
+  if (!bridgeOn() || !isWindows() || now - bridgeAt < 10 * 60000) return ''
   bridgeAt = now
-  const dir = await bridgeDirOf($)
-  const argv = isWindows() ? ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `${dir}/start-bridge.ps1`] : ['bash', `${dir}/start-bridge.sh`]
-  const r = await $.process.run(argv, { timeoutMs: 60000 }).catch(() => null)
+  const r = await $.process.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `${await bridgeDirOf($)}/start-bridge.ps1`], { timeoutMs: 60000 }).catch(() => null)
   return oneLine((r?.stdout ?? '').trim().split(/\r?\n/).pop() ?? '', 160)
 }
-/** Is the Chrome extension talking to the bridge right now? Asked at most once a minute. */
-let liveAt = 0
-let liveWas = false
-async function bridgeLive($: $T): Promise<boolean> {
-  const now = await $.clock.now()
-  if (now - liveAt < 60000) return liveWas
-  liveAt = now
-  const r = await $.process.run(['node', `${await bridgeDirOf($)}/tb.js`, 'health'], { timeoutMs: 5000 }).catch(() => null)
-  liveWas = /"extConnected"\s*:\s*true/.test(r?.stdout ?? '')
-  return liveWas
-}
-let setupToldAt = 0
 
 export const promptPointer = (file: string) => `Read the file ${file} and carry out every instruction in it exactly; finish with the report it asks for. While you work, write one short plain sentence before each step saying what you are about to do and why; never work silently.`
 /** A command line over this goes as a file pointer instead: cmd shims die near 8k, direct exes near 32k on Windows. */
@@ -2031,9 +2038,9 @@ async function briefText($: $T, a: Record<string, unknown>): Promise<string> {
 type WorkerRun = { cli: SquadCli; model: string; effort: number; note: string; route?: { tier: string; isPrivate: boolean } }
 
 /**
- * The owner's worker models, cheap first and strong last: Go, Qoder, then the Claude stops (a hard job
- * has to be able to reach Sonnet and Opus). Qoder stays before Haiku xhigh for when it runs out.
- * Zen's free DeepSeek is not in it: a free model is nobody's default, and a private job never runs on one.
+ * The owner's worker models, cheap first and strong last: Go, Qoder, then the Claude stops (31.10: a hard job
+ * has to be able to reach Sonnet and Opus again). Qoder stays before Haiku xhigh, the owner's rule for when it runs out.
+ * Zen's free DeepSeek is not in it (01.11): a free model is nobody's default, and a private job never runs on one.
  */
 export const WORKER_MODELS_DEFAULT = 'opencode-go/deepseek-v4.1-flash, qoder/DeepSeek-Flash, claude/claude-haiku-5-5, claude/claude-sonnet-5-5, claude/claude-opus-5-5'
 /** worker_models as cli/model pairs; null = off (any model may run). An unknown CLI is dropped, an empty list means the default. */
@@ -2263,7 +2270,7 @@ async function spawnWorker($: $T, args: SpawnRequest) {
 
 /** Starts a worker: outside the app where its CLI allows (so an app restart does not kill it), else as a child of this chat. */
 async function startRun($: $T, w: SquadWorker, prompt: string) {
-  // a retry never starts beside a live process of the same brief (two copies of one job can crash a GPU)
+  // a retry never starts beside a live process of the same brief (30.10: two clean.ts runs crashed one GPU)
   if (w.runs > 1 && !mayStart(await agentAlive($, w))) {
     await patchWorker($, w.id, x => ({ ...x, now: L('The same job is already running: no second process started', 'Aynı iş zaten çalışıyor: ikinci süreç başlatılmadı') }))
     return
@@ -2474,7 +2481,7 @@ async function selfIds($: $T): Promise<string[]> {
 async function saveOption($: $T, field: string, value: string) {
   opts = { ...opts, [field]: value }
   optOverrides = { ...optOverrides, [field]: value }
-  await $.store.set('optOverrides', optOverrides)
+  await storeSet($, 'optOverrides', optOverrides)
   localSeen = null
   await update($, tick, n => (n ?? 0) + 1)
   for (const id of await selfIds($)) {
@@ -2495,10 +2502,10 @@ async function firstSetup($: $T, force: boolean): Promise<string> {
   const done = await $.store.get(SETUP_KEY).catch(() => undefined)
   const surfaces = await $.session.surfaces().catch(() => [] as readonly string[])
   if (!canAskSetup({ interactive, isWorker, role, surfaces, done, now, force })) return ''
-  await $.store.set(SETUP_KEY, { state: 'asking', at: now })
+  await storeSet($, SETUP_KEY, { state: 'asking', at: now })
   $.ui.log(setupInfo())
   const r = await runSetup({ ask: (q, o) => $.ui.ask(q, o), save: (f, v) => saveOption($, f, v) }, opt('api_daily_usd') || '10')
-  await $.store.set(SETUP_KEY, { state: r.state, at: await $.clock.now() })
+  await storeSet($, SETUP_KEY, { state: r.state, at: await $.clock.now() })
   const line = r.state === 'done'
     ? L(`The Chief setup saved (${r.summary}). Change it any time in /chief → Settings.`, `The Chief kurulumu kaydedildi (${r.summary}). İstediğin zaman /chief → Ayarlar'dan değiştir.`)
     : L('The Chief setup skipped: every risky option stays off. Run it any time with /chief setup.', 'The Chief kurulumu atlandı: riskli seçeneklerin hepsi kapalı kalır. İstediğin zaman /chief setup ile çalıştır.')
@@ -2611,7 +2618,7 @@ async function runConsult($: $T, a: Record<string, unknown>): Promise<string> {
   }
   const at = await $.clock.now()
   consultLog = [...results.map(({ c, r }) => ({ at, who: consultantName(c), question: oneLine(typeof a.shown === 'string' && a.shown ? a.shown : question, 300), answer: r.isAnswered ? r.text.slice(0, 4000) : r.text, ms: r.ms, isAnswered: r.isAnswered })), ...consultLog].slice(0, CONSULT_KEEP)
-  await $.store.set(`consults:${sid}`, consultLog).catch(() => undefined)
+  await storeSet($, `consults:${sid}`, consultLog).catch(() => undefined)
   await update($, tick, n => (n ?? 0) + 1)
   const answered = results.filter(x => x.r.isAnswered)
   const failed = results.filter(x => !x.r.isAnswered)
@@ -2658,6 +2665,102 @@ async function checkLogins($: $T, only?: SquadCli) {
     loginCheckedAt = await $.clock.now()
   } finally {
     loginChecking = false
+    await update($, tick, n => (n ?? 0) + 1).catch(() => undefined)
+  }
+}
+
+// ---------- health: a one-word test of each CLI, so a broken sign-in or an empty credit shows before a job lands on it ----------
+type Health = Record<string, { verdict: PingVerdict; why: string; model: string; ms: number; at: number }>
+const healthFile = async ($: $T) => join(await hqDir($), 'health.json')
+/** A CLI is tested again after a day; every chat on this computer shares the answers (hq/health.json). */
+export const HEALTH_EVERY_MS = 24 * 3600_000
+const PING_TIMEOUT_MS = 90_000
+let healthSeen: Health = {}
+let healthChecking = false
+const healthMode = () => (['auto', 'logins', 'off'].includes(opt('health_check')) ? opt('health_check') : 'auto')
+const healthLine = (cli: string, h: Health[string]) => {
+  const label = CLIS[cli as SquadCli]?.label ?? cli
+  if (h.verdict === 'ok') return `\u2713 ${label}: ${L('answers', 'cevap veriyor')} (${h.model}, ${(h.ms / 1000).toFixed(1)} s)`
+  if (h.verdict === 'missing') return `\u2013 ${label}: ${L('not installed', 'kurulu de\u011Fil')}`
+  const fix = h.verdict === 'key' ? ` \u2192 ${L('fix', 'd\u00FCzelt')}: ${LOGIN[cli]?.login ?? L('its key in Settings', 'Ayarlardaki anahtar')}` : ''
+  return `\u2717 ${label}: ${oneLine(h.why, 140)}${fix}`
+}
+
+/** A leader hears each refused sign-in, key or credit once per test result; no other chat gets a turn for it. */
+async function tellLeaderHealth($: $T, seen: Health, now: number) {
+  if (role !== 'leader') return
+  for (const cli of CLI_ORDER) {
+    const h = seen[cli]
+    if (h?.verdict !== 'key' || (await $.store.get(`healthTold:${sid}:${cli}`).catch(() => 0)) === h.at) continue
+    await storeSet($, `healthTold:${sid}:${cli}`, h.at).catch(() => undefined)
+    raise(`health:${cli}`, `! ${healthLine(cli, h)}. ${L('Jobs skip it until it is fixed; the owner fixes the sign-in, then /chief-check.', '\u0130\u015Fler d\u00FCzelene kadar onu atl\u0131yor; giri\u015Fi sahibi d\u00FCzeltir, sonra /chief-check.')}`, false, now, 400)
+  }
+}
+
+/**
+ * Every CLI that is installed and signed in says one word on a small model. One that refuses its key or credit is
+ * taken out of the routes (and the leader hears why); one that answers again is put back. By itself this runs once a
+ * day for the whole computer; forced (the Settings button, /chief-check), every CLI is tested now.
+ */
+async function healthCheck($: $T, force = false): Promise<string> {
+  if (healthChecking) return L('A check is already running.', 'Kontrol zaten s\u00FCr\u00FCyor.')
+  const path = await healthFile($)
+  const seen: Health = (await readJson<Health>($, path)) ?? {}
+  healthSeen = seen
+  const started = await $.clock.now()
+  // a stamp that was never set is not "just now"
+  const within = async (key: string, ms: number) => {
+    const at = Number(await $.store.get(key).catch(() => 0)) || 0
+    return at > 0 && started - at < ms
+  }
+  // another chat tested within the day, or is testing now: its answers are read, nothing runs twice
+  if (!force && (healthMode() === 'off' || (await within('healthDoneAt', HEALTH_EVERY_MS)) || (await within('healthRunAt', 15 * 60000)))) {
+    await tellLeaderHealth($, seen, started).catch(() => undefined)
+    return ''
+  }
+  await storeSet($, 'healthRunAt', started).catch(() => undefined)
+  healthChecking = true
+  await update($, tick, n => (n ?? 0) + 1).catch(() => undefined)
+  try {
+    await checkLogins($).catch(() => undefined)
+    if (force || healthMode() === 'auto') {
+      for (const cli of CLI_ORDER) {
+        const login = loginSeen[cli]?.verdict
+        const key = CLIS[cli].key
+        // not installed, or signed out with no key: the sign-in check already says so
+        if (login === 'missing' || (login === 'out' && !(key && opt(key.field)))) {
+          delete seen[cli]
+          continue
+        }
+        const model = pingModel(modelsOf(cli))
+        const outFile = join(await hqDir($), 'consult', `health-${cli}.md`)
+        const argv = pingArgv(cli, model, outFile, isWindows())
+        if (!argv) continue
+        const at = await $.clock.now()
+        const run = (a: string[]) => $.process.run(a, { cwd: cwd || undefined, env: { ...WORKER_ENV, THE_CHIEF_BOOTSTRAP: '1', ...envFor(cli) }, timeoutMs: PING_TIMEOUT_MS }).catch(err => ({ exitCode: -1, stdout: '', stderr: String(err) }))
+        // Codex writes its last message to the file; the folder must exist before it does
+        if (cli === 'codex') await $.fs.write(outFile, '').catch(() => undefined)
+        let r = await run(argv)
+        // a claude that does not know the flag yet: the same test without it
+        if (cli === 'claude' && r.exitCode !== 0 && /unknown option/i.test(`${r.stderr}\n${r.stdout}`)) r = await run(argv.filter(x => x !== '--no-session-persistence'))
+        const out = cli === 'codex' ? (await readText($, outFile).catch(() => '')).trim() || r.stdout : r.stdout
+        const v = pingVerdict(r.exitCode, out, r.stderr, AUTH_RE, RATE_RE)
+        seen[cli] = { ...v, model, ms: (await $.clock.now()) - at, at }
+        if (v.verdict === 'key') await markProviderDown($, cli, v.why, true).catch(() => undefined)
+        else if (v.verdict === 'ok') await clearProviderDown($, cli).catch(() => undefined)
+      }
+      await $.fs.write(path, JSON.stringify(seen)).catch(() => undefined)
+      // a run that was cut off (the chat closed) leaves no stamp, so the next chat tests again
+      await storeSet($, 'healthDoneAt', await $.clock.now()).catch(() => undefined)
+    }
+    healthSeen = seen
+    await tellLeaderHealth($, seen, await $.clock.now()).catch(() => undefined)
+    const lines = CLI_ORDER.filter(c => seen[c]).map(c => healthLine(c, seen[c]!))
+    const bad = lines.filter(l => l.startsWith('\u2717'))
+    if (bad.length) $.ui.toast(oneLine(bad.join(' \u00B7 '), 300))
+    return lines.join('\n') || L('No CLI to test: none is installed and signed in.', 'Denenecek CLI yok: kurulu ve giri\u015Fli olan yok.')
+  } finally {
+    healthChecking = false
     await update($, tick, n => (n ?? 0) + 1).catch(() => undefined)
   }
 }
@@ -2831,7 +2934,7 @@ async function refreshModels($: $T, cli: SquadCli, force: boolean) {
     const models = res.exitCode === 0 ? parseModelList(cli, res.stdout) : []
     if (models.length) {
       modelCache = { ...modelCache, [cli]: { at: now, models } }
-      await $.store.set('modelCache', modelCache)
+      await storeSet($, 'modelCache', modelCache)
     } else if (force) $.ui.toast(L(`${CLIS[cli].label}: could not read the model list`, `${CLIS[cli].label}: model listesi okunamadı`))
   } catch {
     if (force) $.ui.toast(L(`${CLIS[cli].label}: could not read the model list`, `${CLIS[cli].label}: model listesi okunamadı`))
@@ -3228,15 +3331,26 @@ async function limitedNow($: $T): Promise<Set<string>> {
 }
 
 /** A provider that failed on its key or credit is skipped by every chat for 6 hours; the leader hears it once. */
-async function markProviderDown($: $T, cli: string, line: string) {
+async function markProviderDown($: $T, cli: string, line: string, quiet = false) {
   const now = await $.clock.now()
   const path = await providersFile($)
   const down = (await readJson<ProviderDown>($, path)) ?? {}
   if (down[cli] && down[cli]!.until > now) return
   down[cli] = { until: now + PROVIDER_DOWN_MS, cause: oneLine(line, 160), at: now }
   await $.fs.write(path, JSON.stringify(down))
+  // the daily test runs in whatever chat is open: it never starts a turn there, the leader is told by tellLeaderHealth
+  if (quiet) return
   const label = CLIS[cli as SquadCli]?.label ?? cli
-  raise(`provider:${cli}`, L(`! ${label} is off (${oneLine(line, 100)}): skipped for 6 hours, jobs fall back to the next route (last: Sonnet on API credit). Delete it from hq/providers.json once the key is renewed.`, `! ${label} kapalı (${oneLine(line, 100)}): 6 saat atlanıyor, işler yedek rotaya (en son API kredisiyle Sonnet) düşüyor. Anahtar yenilenince hq/providers.json'dan sil.`), true, now, 400)
+  raise(`provider:${cli}`, L(`! ${label} is off (${oneLine(line, 100)}): skipped for 6 hours, jobs fall back to the next route (last: Sonnet on API credit). Once the sign-in or key is fixed, run /chief-check: a test that passes turns it back on.`, `! ${label} kapalı (${oneLine(line, 100)}): 6 saat atlanıyor, işler yedek rotaya (en son API kredisiyle Sonnet) düşüyor. Giriş ya da anahtar düzelince /chief-check çalıştır: geçen deneme onu geri açar.`), true, now, 400)
+}
+
+/** A provider that answers again is back in the routes at once. */
+async function clearProviderDown($: $T, cli: string) {
+  const path = await providersFile($)
+  const down = (await readJson<ProviderDown>($, path)) ?? {}
+  if (!down[cli]) return
+  delete down[cli]
+  await $.fs.write(path, JSON.stringify(down))
 }
 
 /** The promo API credit: a day's spend kept in hq/api-spend/<day>.jsonl, by this plugin's workers and claude-api.sh. */
@@ -3297,6 +3411,34 @@ export function raise(key: string, line: string, isUrgent: boolean, now: number,
   alertedWords.set(key, alarmWords(line))
   alerts.push({ key, line: line.slice(0, max), isUrgent, at: now })
   if (role === 'chief' && leaderSid) forwardLines.push(line.slice(0, 160))
+}
+
+/** When a worker's end was told (the key of its end alert), at or after `since`; 0 while it has not been. */
+export function endToldAt(told: Iterable<[string, number]>, workerId: string, since: number): number {
+  for (const [key, at] of told) if (key.startsWith(`end:${workerId}:`) && at >= since) return at
+  return 0
+}
+
+export const WAIT_STEP_MS = 3000
+/**
+ * spawn_worker wait:true: the call holds until the worker's end is told, then answers with that line, its report and
+ * its last lines, so a CLI worker's result comes back as a subagent's does (no second turn, no agent_output call).
+ * The end alert is taken out of the queue: it does not also ride a later tool result or start a turn of its own.
+ * shortcut: held at most 15 minutes (a chief silent for 20 is reported stuck); longer runs fall back to the usual notice.
+ */
+async function waitForWorker($: $T, name: string, minutes: number, since: number): Promise<string> {
+  const until = since + clamp(minutes, 1, 15) * 60000
+  for (;;) {
+    const { value: ws = [] } = await $.state.get(WORKERS)
+    const worker = ws.filter(w => w.name === name).sort((x, y) => y.startedAt - x.startedAt)[0]
+    if (worker && endToldAt(alertedAt, worker.id, since)) {
+      const i = alerts.findIndex(x => x.key.startsWith(`end:${worker.id}:`))
+      const line = i >= 0 ? alerts.splice(i, 1)[0]!.line : `${worker.name} ${worker.status}`
+      return `${line}${worker.report ? `\nreport: ${worker.report.slice(0, 3000)}` : ''}\n${worker.tail.slice(-30).join('\n') || '(the CLI printed nothing readable)'}`
+    }
+    if ((await $.clock.now()) >= until) return `${name} is still running after ${clamp(minutes, 1, 15)} min: you are told when it finishes; agent_output shows where it is.`
+    await $.clock.sleep(WAIT_STEP_MS)
+  }
 }
 
 /** A chief's agent alerts on their way to its leader, sent together on the next tick. */
@@ -3368,7 +3510,7 @@ const CHIEF_ASK_TAIL = '(A chief that finished: release_chief, and its next job 
 let mainTurn = false
 
 // ---------- Budget: keep the chat's own context small, since every turn re-reads all of it ----------
-// Measured on real usage: cache reads were ~65% of spend, the average call carried ~370k
+// Measured on this machine (Sep 22 - Oct 7): cache reads were ~65% of spend, the average call carried ~370k
 // tokens of context and auto-compact only fired near 967k. Compacting earlier, recompacting a cold cache instead
 // of rewriting it, and capping blind whole-file reads cut that without taking any capability away.
 
@@ -3404,7 +3546,20 @@ let lastTurnEndAt = 0
 /** A compact the guard ran: the size it left is kept (anti-thrash survives a reload), and a size-guard one is counted toward the handoff. */
 async function countCompact($: $T, after: number, isCold: boolean) {
   lastCompactAfter = after
-  await recordCompact(portsOf($), sid, after, isCold).catch(() => undefined)
+  const s = await recordCompact(portsOf($), sid, after, isCold).catch(() => null)
+  if (s) await noteCompactsHere($, s.compacts)
+}
+
+/** Size compacts of this chat since it started: from HANDOFF_WARN on, the Oturum tab says a handoff is due (never automatic). */
+const HANDOFF_WARN = 3
+let compactsHere = 0
+async function noteCompactsHere($: $T, n: number) {
+  const crossed = n >= HANDOFF_WARN && compactsHere < HANDOFF_WARN
+  compactsHere = n
+  if (!crossed || isWorker) return
+  const msg = L(`The Chief: this chat has compacted ${n} times; each summary loses a little. A handoff is due (Oturum tab).`, `The Chief: bu sohbet ${n} kez sıkıştırıldı, her özet biraz kaybettiriyor. Devir zamanı (Oturum sekmesi).`)
+  $.ui.toast(msg)
+  $.ui.log(msg)
 }
 
 async function contextTokens($: $T): Promise<number> {
@@ -3456,7 +3611,7 @@ async function compactIfLarge($: $T, o: BudgetOptions, why: 'size' | 'cold' | 'i
       slashCompactAt = Date.now()
       pendingCompact = { before, cold: asCold }
       // kept in the store too: a reload between the /compact and the next request must not lose the saving
-      await $.store.set(`pendingCompact:${sid}`, pendingCompact).catch(() => undefined)
+      await storeSet($, `pendingCompact:${sid}`, pendingCompact).catch(() => undefined)
       const brief = oneLine(compactBrief(focus, why), 1500)
       // the command itself, as /goal runs; a typed /compact when the host takes no command from a plugin
       await $.command.run({ command: 'compact', args: brief }).catch(() => $.prompt.submit({ text: `/compact ${brief}`, asUser: true }))
@@ -3483,7 +3638,7 @@ let stopShownUntil = 0
 let endedOpen = true
 
 // ---------- the Skills tab: every skill on this computer by category, one click puts it in the chat box ----------
-export type SkillItem = { name: string; desc: string; path: string; src: 'global' | 'project'; callable: boolean }
+export type SkillItem = { name: string; desc: string; path: string; src: 'clients' | 'global' | 'project'; callable: boolean }
 export const SKILL_CATEGORIES = ['Kurgu', 'Altyazı & başlık', 'Grafik, harita & medya', 'İndir, izle, incele', 'Upwork', 'Diğer'] as const
 /** The category a skill sits in, from its name. Pure, so it is tested. */
 const SKILL_CAT_EN: Record<string, string> = { Kurgu: 'Editing', 'Altyazı & başlık': 'Captions & titles', 'Grafik, harita & medya': 'Graphics, maps & media', 'İndir, izle, incele': 'Download, watch, review', Upwork: 'Upwork', Diğer: 'Other' }
@@ -3543,7 +3698,7 @@ async function loadSkills($: $T): Promise<SkillItem[]> {
       const name = head.name || d.name
       if (r.src === 'global') registered.add(name)
       const have = byName.get(name)
-      if (have) continue
+      if (have && have.src !== 'clients') continue
       byName.set(name, { name, desc: head.desc, path: file, src: r.src, callable: false })
     }
   }
@@ -3657,6 +3812,8 @@ async function contextGuard($: $T) {
     await noteGuard($, -1, 'skipped: a new turn had started')
     return
   }
+  // the panel's handoff warning survives a reload: the count is read back silently
+  if (!compactsHere) compactsHere = (await readSess(portsOf($), sid).catch(() => null))?.compacts ?? 0
   const ctx = await contextTokens($).catch(() => -1)
   const done = await compactIfLarge($, budget(), 'size', chiefConfig.goal || (await activeGoal($)) || '')
   await noteGuard($, ctx, done ? `compacted ${done}` : ctx >= budget().guardTokens ? 'over the guard, not compacted' : 'under the guard')
@@ -3699,7 +3856,7 @@ async function idleCompact($: $T, now: number): Promise<boolean> {
 /** What the context guard last did in this chat, kept in the store so a run can be checked afterwards. */
 async function noteGuard($: $T, ctx: number, outcome: string) {
   try {
-    await $.store.set(`guard:${sid}`, { at: await $.clock.now(), ctx, limit: budget().guardTokens, outcome })
+    await storeSet($, `guard:${sid}`, { at: await $.clock.now(), ctx, limit: budget().guardTokens, outcome })
   } catch {
     // the record is a help, never a failure
   }
@@ -3710,6 +3867,14 @@ async function noteGuard($: $T, ctx: number, outcome: string) {
  * price. Compacting now, once per idle spell, means it writes a short summary instead. (A prompt.submit hook may
  * not compact under the turn it holds, so this runs on the clock while nothing is running.)
  */
+/** Removes the store keys of chats not seen for 14 days, at most once every 6 hours across all chats (storekeep.ts). */
+async function pruneOld($: $T): Promise<void> {
+  const now = await $.clock.now()
+  if (now - Number((await $.store.get('pruneAt')) ?? 0) < 6 * 3600_000) return
+  await storeSet($, 'pruneAt', now)
+  const gone = await pruneStore($, now, 14 * 86400_000)
+  if (gone > 0) $.ui.log(L(`The Chief: removed ${gone} store keys of chats gone 14+ days.`, `The Chief: 14+ gündür kapalı sohbetlerin ${gone} depo kaydı silindi.`))
+}
 async function coldGuard($: $T) {
   if (!interactive || isWorker || mainTurn || coldSeenFor === lastTurnEndAt || !isCold(await $.clock.now(), budget())) return
   coldSeenFor = lastTurnEndAt
@@ -3744,7 +3909,7 @@ export function compactCostUsd(before: number, after: number, model: string, col
 }
 
 /** The 5h and weekly windows out of the session's rate limits (the per-model weekly ones are left out). */
-// ---------- Drawing kit (desktop): line icons, rounded bars and agent dots, as small SVG documents ----------
+// ---------- Drawing kit (desktop): line icons, rounded bars and pixel mascots, as small SVG documents ----------
 /** Line icons on a 24-unit grid, drawn with a 2-unit round stroke. */
 export const ICON_PATHS: Record<string, string> = {
   layers: 'M12 3 3 8l9 5 9-5-9-5Z M3 12.5l9 5 9-5 M3 17l9 5 9-5',
@@ -3770,17 +3935,17 @@ export function barSvg(pct: number, width: number, color: string, height = 6, tr
   const w = p === 0 ? 0 : Math.max(height, Math.round((p / 100) * width))
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="${width}" height="${height}" rx="${r}" fill="${track}"/>${w ? `<rect width="${w}" height="${height}" rx="${r}" fill="${color}"/>` : ''}</svg>`
 }
-/** An agent's icon: a plain dot in its CLI's colour. */
+/** An agent's mark: a plain dot in the CLI's colour. */
 export function mascotSvg(color: string, size = 22): string {
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="${color}"/></svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8" fill="${color}"/></svg>`
 }
-/** The Chief's icon: a diamond that breathes (CSS inside the SVG, since the app runs no script in an icon). */
+/** The Chief's mark: the same dot with a slow ring breathing out of it (CSS in the SVG: the app runs no script in an icon). */
 export function liveMascotSvg(color = '#DD775B', size = 26): string {
-  const css = '.d{transform-box:view-box;transform-origin:10px 10px;animation:br 3s ease-in-out infinite}@keyframes br{50%{transform:scale(.82);opacity:.75}}@media (prefers-reduced-motion:reduce){.d{animation:none}}'
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 20 20"><style>${css}</style><path class="d" d="M10 2 18 10 10 18 2 10Z" fill="${color}"/></svg>`
+  const css = '.r{transform-origin:10px 10px;animation:p 3s ease-out infinite}@keyframes p{0%{transform:scale(.8);opacity:.6}100%{transform:scale(1.25);opacity:0}}@media (prefers-reduced-motion:reduce){.r{animation:none;opacity:0}}'
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 20 20"><style>${css}</style><circle class="r" cx="10" cy="10" r="8" fill="none" stroke="${color}" stroke-width="1.5"/><circle cx="10" cy="10" r="6" fill="${color}"/></svg>`
 }
 
-/** Each CLI's icon colour (Claude in its own coral). */
+/** Each CLI's mascot colour (Claude in its own coral). */
 export const CLI_TINT: Record<string, string> = { claude: '#d97757', devin: '#5ccb7a', qoder: '#6aa2f2', gemini: '#8ab4f8', antigravity: '#a78bfa', codex: '#e6e6e6', 'opencode-go': '#f2c46a', 'opencode-zen': '#f2c46a', 'opencode-ollama': '#9aa0a6', custom: '#9aa0a6' }
 /** The pill tones of the band: a dark tinted ground, a thin border, and the accent. */
 export const TONES = {
@@ -3913,7 +4078,7 @@ async function saveLedger($: $T, force = false) {
   const now = await $.clock.now()
   if (!ledgerLoaded || (!force && now - ledgerSavedAt < 15_000)) return
   ledgerSavedAt = now
-  await $.store.set(`saved:${sid}`, ledger)
+  await storeSet($, `saved:${sid}`, ledger)
 }
 
 /** The context a ledger's compactions took off (ledgers written before v1.24 kept it only in `carried`). */
@@ -3979,7 +4144,7 @@ async function noteStep($: $T, model: string, u: StepUsage | null, isSub: boolea
   if (pendingCompact && lastMainCtx < pendingCompact.before * 0.6) {
     const pc = pendingCompact
     pendingCompact = null
-    await $.store.set(`pendingCompact:${sid}`, null).catch(() => undefined)
+    await storeSet($, `pendingCompact:${sid}`, null).catch(() => undefined)
     await countCompact($, lastMainCtx, pc.cold)
     compactedSince = true
     await noteCompact($, pc.before, lastMainCtx, pc.cold).catch(() => undefined)
@@ -4063,7 +4228,7 @@ async function refreshBudget($: $T) {
   }
   if (moved || now - calibSampleAt > 3600_000) {
     calibSampleAt = now
-    await $.store.set('perUsd', perUsd)
+    await storeSet($, 'perUsd', perUsd)
   }
   await showBudget($)
 }
@@ -4193,6 +4358,10 @@ type ChiefConfig = {
   subagents?: { model?: string; effort?: string; max?: number }
   lanes?: SquadLane[]
   goal?: string
+  /** How the chief works: 'self' (does it itself), 'delegate' (hands it out to workers) or 'either' (its call); absent = the owner's chief_work, else either. */
+  work?: string
+  /** A shell command that must exit 0 before this chief's DONE counts (its tests, a build), run in its folder. */
+  check?: string
   /** The 2-compact / 8-hour automatic handoff (absent = on). Off, this chief is only handed over by hand. */
   handoff?: boolean
   /** The 50-minute idle compact (absent = on). Off, this chief's context is only compacted by the size guard. */
@@ -4233,6 +4402,8 @@ type HqCard = {
   stalled?: boolean
   /** It said its goal is done: not nudged until it gets new work. */
   done?: boolean
+  /** Its DONE failed the check twice: the leader looks, the plugin never releases it by itself. */
+  unverified?: boolean
   /** API-priced dollars this run has spent (the budget meter sums every chat's for its calibration). */
   spentUsd?: number
   /** The last time the owner typed into this chat: it is not archived within 30 minutes of it. */
@@ -4418,7 +4589,7 @@ async function setRole($: $T, next: Role, leader: string | null = null, title = 
   role = next
   leaderSid = leader
   leaderTitle = title
-  await $.store.set(`role:${sid}`, { role, leaderSid, leaderTitle })
+  await storeSet($, `role:${sid}`, { role, leaderSid, leaderTitle })
   lastCardJson = ''
   await update($, tick, n => (n ?? 0) + 1)
 }
@@ -4426,10 +4597,13 @@ async function setRole($: $T, next: Role, leader: string | null = null, title = 
 /** Takes a leader's settings: model and effort apply from the next request, lanes and the goal at once. */
 async function applyConfig($: $T, patch: ChiefConfig) {
   const before = chiefConfig.goal
+  const workBefore = chiefConfig.work
   chiefConfig = { ...chiefConfig, ...patch, subagents: patch.subagents ? { ...chiefConfig.subagents, ...patch.subagents } : chiefConfig.subagents }
-  await $.store.set(`chiefConfig:${sid}`, chiefConfig)
+  await storeSet($, `chiefConfig:${sid}`, chiefConfig)
   if (patch.lanes) await $.state.set(LANES, patch.lanes.map(l => ({ ...l, id: l.id || newId(), cli: normalizeCli(l.cli), count: clamp(Number(l.count) || 1, 1, MAX_AGENTS), effort: clamp(Number(l.effort) || 0, 0, EFFORT_WORDS.length - 1), task: l.task ?? '' })))
-  if (patch.goal && patch.goal !== before) enqueue({ kind: 'submit', text: role === 'chief' ? chiefGoalMessage(patch.goal) : goalMessage(patch.goal) })
+  if (patch.goal && patch.goal !== before) enqueue({ kind: 'submit', text: role === 'chief' ? chiefGoalMessage(patch.goal, chiefConfig.work) : goalMessage(patch.goal) })
+  // the way of working changed and no new goal carries it: the chief is told once
+  else if (role === 'chief' && patch.work && patch.work !== workBefore) enqueue({ kind: 'submit', text: `The leader changed how you work on your goal. ${chiefRule(patch.work)}`, asUser: false })
   lastCardJson = ''
   await update($, tick, n => (n ?? 0) + 1)
 }
@@ -4478,7 +4652,7 @@ async function procsnapExe($: $T): Promise<string | null> {
   return path
 }
 /**
- * The machine's processes on Windows, never through WMI (it can hang): procsnap.exe, else tasklist (ids and
+ * The machine's processes on Windows, never through WMI (owner's ban after 19.10): procsnap.exe, else tasklist (ids and
  * names only). Null when neither answers.
  */
 async function snapshot($: $T): Promise<{ freeMb: number; procs: SnapProc[]; full: boolean } | null> {
@@ -4623,7 +4797,7 @@ async function heavyGateTick($: $T): Promise<void> {
   // the build lock (train config `lock`): its holder is never held, or everyone waiting on the lock waits behind it
   const lockDir = (await readJson<{ lock?: string }>($, join(dir, 'train', 'config.json')))?.lock
   const lockSt = lockDir ? await $.fs.stat(lockDir).catch(() => null) : null
-  const plan = gatePlan(snap.procs, state?.waiting ?? [], { freeMb: snap.freeMb, reserveMb: Math.max(4096, ramReserveMb()), slotMb: 3500, maxSlots: 4, now, maxWaitMs: 30 * 60000, lockAt: lockSt?.mtimeMs })
+  const plan = gatePlan(snap.procs, state?.waiting ?? [], { freeMb: snap.freeMb, reserveMb: Math.max(4096, ramReserveMb()), slotMb: 3500, maxSlots: 1, now, maxWaitMs: 30 * 60000, lockAt: lockSt?.mtimeMs })
   if (plan.suspend.length) await $.process.run(['powershell', '-NoProfile', '-Command', suspendPs(plan.suspend, true)], { timeoutMs: 30000 }).catch(() => null)
   if (plan.resume.length) await $.process.run(['powershell', '-NoProfile', '-Command', suspendPs(plan.resume, false)], { timeoutMs: 30000 }).catch(() => null)
   // under 1.8 GB free a held build still holds its RAM: one heavy tree a step is ended (what ram-guard.ps1 did)
@@ -4908,8 +5082,8 @@ export function reportResumeStep(v: {
 }
 /**
  * True when a process of this worker is still alive: one carrying its prompt file or its session id. Every retry,
- * failover, stall restart and resume checks this, so two runs of one brief never overlap (two
- * copies of one job can crash a GPU). Pure over one process list, so it is tested.
+ * failover, stall restart and resume checks this, so two runs of one brief never overlap (30.10: two clean.ts runs
+ * crashed one GPU). Pure over one process list, so it is tested.
  */
 export function agentAliveIn(tree: readonly ProcInfo[], w: Pick<SquadWorker, 'name' | 'cli' | 'dir' | 'runs' | 'sessionId'>): boolean {
   if (workerRootPids(tree, w).length > 0 || opencodeWorkerPid(tree, w) > 0) return true
@@ -4979,7 +5153,7 @@ async function tellStuckWorkers($: $T, rows: WorkerRow[], ws: SquadWorker[]) {
 async function alarmOnce($: $T, key: string, now: number): Promise<boolean> {
   const told = await $.store.get(key).catch(() => undefined)
   if (!alarmDue(told)) return false
-  await $.store.set(key, { at: now } as never).catch(() => undefined)
+  await storeSet($, key, { at: now } as never).catch(() => undefined)
   void pruneAlarms($, now).catch(() => undefined)
   return true
 }
@@ -4991,7 +5165,7 @@ async function pruneAlarms($: $T, now: number) {
   for (const k of await $.store.keys().catch(() => [] as string[])) {
     if (!k.startsWith('walm:')) continue
     const v = (await $.store.get(k).catch(() => null)) as { at?: number } | null
-    if (!v || now - (v.at ?? 0) > 30 * 24 * 3600000) await $.store.set(k, null as never).catch(() => undefined)
+    if (!v || now - (v.at ?? 0) > 30 * 24 * 3600000) await storeSet($, k, null as never).catch(() => undefined)
   }
 }
 /** Stops a stuck worker (a dropped one has nothing to stop) and starts it again in the same folder; false when it cannot. */
@@ -5034,7 +5208,7 @@ function workersText(now: number): string {
 }
 
 /**
- * Workers this chat started outside spawn_worker (a project's own helper scripts and the like): each drops
+ * Workers this chat started outside spawn_worker (lumiere/tools/claude-api.sh and the like): each drops
  * hq/ext/<id>.json {sid, at, name} while it runs (CLAUDE_CODE_SESSION_ID is the starting chat) and removes it at exit.
  * Files older than an hour are a run that was killed without its trap. They count as working, so a chief with
  * five API workers is never "işçisiz" (18.10).
@@ -5060,7 +5234,7 @@ async function writeCard($: $T) {
   if (!sid || handedOff) return
   const now = await $.clock.now()
   const versions = [(await $.state.get(WORKERS)).version, (await $.state.get(SUBS)).version, (await $.state.get(REPORTS)).version, (await $.state.get(GOALS)).version]
-  const key = `${versions.join('.')}|${role}|${leaderSid}|${JSON.stringify(chiefConfig)}|${lastModelSeen}|${lastEffortSeen}|${mainGoalId}|${mainTurn}|${waitingOwner}|${stalled}|${goalDone}`
+  const key = `${versions.join('.')}|${role}|${leaderSid}|${JSON.stringify(chiefConfig)}|${lastModelSeen}|${lastEffortSeen}|${mainGoalId}|${mainTurn}|${waitingOwner}|${stalled}|${goalDone}|${doneUnverified}`
   if (key === lastCardKey && now - lastCardAt < 60000) return
   lastCardKey = key
   const { value: ws = [] } = await $.state.get(WORKERS)
@@ -5097,6 +5271,7 @@ async function writeCard($: $T) {
     waitingOwner,
     stalled,
     done: goalDone,
+    ...(doneUnverified ? { unverified: true } : {}),
     spentUsd: Math.round(spentUsd * 100) / 100,
     ownerTypedAt,
     chat: idSettled || lastSurface === 'terminal',
@@ -5129,7 +5304,7 @@ async function markReleased($: $T, chiefSid: string) {
   await loadReleased($)
   releasedChiefs.set(chiefSid, await $.clock.now())
   hqCards = hqCards.map(c => (c.sid === chiefSid ? releasedView(c) : c))
-  await $.store.set(`released:${sid}`, Object.fromEntries(releasedChiefs)).catch(() => undefined)
+  await storeSet($, `released:${sid}`, Object.fromEntries(releasedChiefs)).catch(() => undefined)
   // the chief's own card says "chief of me" until its next turn, and an archived chat has none: the leader rewrites it,
   // so no copy of the plugin (inline or synced, before or after a reload) watches it again (25.10: "stopped answering"
   // went on for an archived chief released twice)
@@ -5146,7 +5321,7 @@ async function markReleased($: $T, chiefSid: string) {
 async function unmarkReleased($: $T, chiefSid: string) {
   await loadReleased($)
   if (!releasedChiefs.delete(chiefSid)) return
-  await $.store.set(`released:${sid}`, Object.fromEntries(releasedChiefs)).catch(() => undefined)
+  await storeSet($, `released:${sid}`, Object.fromEntries(releasedChiefs)).catch(() => undefined)
 }
 
 // ---------- a chief the owner stopped stays stopped ----------
@@ -5236,7 +5411,7 @@ async function loadBriefSeen($: $T) {
 
 /** Kept per leader, so a reload does not print every chief's old brief again. */
 async function saveBriefSeen($: $T) {
-  await $.store.set(`briefSeen:${sid}`, Object.fromEntries(briefShown)).catch(() => undefined)
+  await storeSet($, `briefSeen:${sid}`, Object.fromEntries(briefShown)).catch(() => undefined)
 }
 
 // ---------- an effort the leader set, read back from the chief's card ----------
@@ -5280,7 +5455,7 @@ type EffortAsk = { effort: string; at: number; retried?: boolean }
 async function askEffort($: $T, chiefSid: string, effort: string) {
   const held = ((await $.store.get(`effortAsk:${sid}`).catch(() => undefined)) as Record<string, EffortAsk> | undefined) ?? {}
   held[chiefSid] = { effort, at: await $.clock.now(), retried: false }
-  await $.store.set(`effortAsk:${sid}`, held).catch(() => undefined)
+  await storeSet($, `effortAsk:${sid}`, held).catch(() => undefined)
 }
 
 /**
@@ -5296,7 +5471,7 @@ async function checkEffortAsks($: $T) {
   const tell = async (chiefSid: string, line: string) => {
     const c = hqCards.find(x => x.sid === chiefSid)
     leaderLog = [...leaderLog, { at: now, from: chiefSid, title: c ? titleOf(c) : chiefSid.slice(0, 8), line }].slice(-200)
-    await $.store.set(`leaderLog:${sid}`, leaderLog).catch(() => undefined)
+    await storeSet($, `leaderLog:${sid}`, leaderLog).catch(() => undefined)
   }
   for (const [chiefSid, ask] of Object.entries(held)) {
     const card = await cardEffort($, chiefSid)
@@ -5326,7 +5501,7 @@ async function checkEffortAsks($: $T) {
     delete held[chiefSid]
     changed = true
   }
-  if (changed) await $.store.set(`effortAsk:${sid}`, held).catch(() => undefined)
+  if (changed) await storeSet($, `effortAsk:${sid}`, held).catch(() => undefined)
 }
 
 /** The leader's view: every card changed in the last two days, read again only when its file changed. */
@@ -5367,7 +5542,7 @@ async function readCards($: $T) {
   // a released chief's own card may still say chief; once it says anything else, the leader's mark has done its job
   let dropped = false
   for (const c of next) if (releasedChiefs.has(c.sid) && !(c.role === 'chief' && c.leader === sid) && releasedChiefs.delete(c.sid)) dropped = true
-  if (dropped) await $.store.set(`released:${sid}`, Object.fromEntries(releasedChiefs)).catch(() => undefined)
+  if (dropped) await storeSet($, `released:${sid}`, Object.fromEntries(releasedChiefs)).catch(() => undefined)
   hqCards = next.map(releasedView).sort((a, b) => b.updatedAt - a.updatedAt)
   lastCardsRead = now
 }
@@ -5411,12 +5586,14 @@ async function onHqMessage($: $T, msg: HqMessage) {
   if (msg.kind === 'join') {
     if (role === 'leader') return
     await setRole($, 'chief', msg.from, msg.fromTitle)
+    // opened by the app with its goal as the first message: the goal is this chat's already, not a new one to send
+    if (msg.args.started === true && typeof (msg.args.config as ChiefConfig | undefined)?.goal === 'string') chiefConfig = { ...chiefConfig, goal: (msg.args.config as ChiefConfig).goal }
     if (msg.args.config && typeof msg.args.config === 'object') await applyConfig($, msg.args.config as ChiefConfig)
     await sendTo($, msg.from, 'report', { line: `+ ${projectTitle()} is now your chief${chiefConfig.goal ? ` · goal: ${oneLine(chiefConfig.goal, 80)}` : ''}` })
     $.ui.toast(`The Chief: this chat now reports to ${msg.fromTitle} (leader)`)
   } else if (msg.kind === 'release' && msg.from === leaderSid) {
     chiefConfig = {}
-    await $.store.set(`chiefConfig:${sid}`, chiefConfig)
+    await storeSet($, `chiefConfig:${sid}`, chiefConfig)
     await setRole($, 'solo')
     void $.tool.call({ tool: 'mcp__ccd_sidebar__set_pinned', session_id: 'self', pinned: false } as never).catch(() => undefined)
     $.ui.toast('The Chief: released by the leader; this chat runs on its own again')
@@ -5440,7 +5617,7 @@ async function onHqMessage($: $T, msg: HqMessage) {
     if (msg.args.isNew === true && str('goal')) void nameChief($, msg.from, str('goal'))
     const name = sessionTitles[msg.from] || msg.fromTitle
     leaderLog = [...leaderLog, { at: now, from: msg.from, title: name, line: oneLine(str('line'), 600) }].slice(-200)
-    await $.store.set(`leaderLog:${sid}`, leaderLog)
+    await storeSet($, `leaderLog:${sid}`, leaderLog)
     // the same wait or the same question again (a chief re-saying it after each nudge or reply) is news, not a turn:
     // a leader answering it only starts the chief's next turn, which says it again
     const again = msg.args.isUrgent !== true && msg.args.isQuestion === true && askedBefore(msg.from, str('line'), now)
@@ -5452,6 +5629,9 @@ async function onHqMessage($: $T, msg: HqMessage) {
       // a question, a decision or an error: the leader decides (and asks the owner only if it is theirs); several
       // gather into one turn, and one that comes mid-turn rides a tool result
       raise(`chief:${msg.from}:${msg.id}`, `${msg.args.isQuestion === true ? '?' : '!'} ${name} [${msg.from.slice(0, 8)}]: ${oneLine(str('line'), 600)}`, true, now, 700)
+    } else if (msg.args.isDone === true && msg.args.unverified === true) {
+      // its DONE failed the check twice: never released by itself, the leader looks
+      raise(`chief:done:${msg.from}:${msg.id}`, `! ${name} [${msg.from.slice(0, 8)}] says it is finished, but the check did not pass: ${oneLine(str('line'), 500)} (look yourself before release_chief)`, false, now, 700)
     } else if (msg.args.isDone === true && opt('auto_release_done') !== 'off') {
       // a finished chief is released by the plugin once it is idle: no turn of the leader's for it, the news waits in list_chiefs
       digest.push({ title: name, line: oneLine(str('line'), 160) })
@@ -5569,7 +5749,7 @@ async function openSession($: $T, id: string) {
 
 /** The leader names a chief chat after its goal (the app asks first if the person named it themselves). */
 async function nameChief($: $T, id: string, goal: string) {
-  if (!goal.trim()) return
+  if (!goal.trim() || !autoTitle()) return
   // the same title rule as every session (2-5 Turkish words, no "Chief ·"); the chief's own guard then leaves it alone
   const p = portsOf($)
   const r = await nameOnce(p, id, `local_${id}`, () => titleFor($, goal))
@@ -5644,17 +5824,17 @@ async function settleIdentityOnce($: $T) {
   role = picked.role ?? 'solo'
   leaderSid = picked.leaderSid ?? null
   leaderTitle = picked.leaderTitle ?? ''
-  await $.store.set(`role:${sid}`, { role, leaderSid, leaderTitle })
+  await storeSet($, `role:${sid}`, { role, leaderSid, leaderTitle })
   const cfgAtApp = await $.store.get(`chiefConfig:${app}`)
   if (picked === atApp && cfgAtApp && typeof cfgAtApp === 'object') chiefConfig = cfgAtApp as ChiefConfig
-  else if (Object.keys(chiefConfig).length) await $.store.set(`chiefConfig:${sid}`, chiefConfig)
+  else if (Object.keys(chiefConfig).length) await storeSet($, `chiefConfig:${sid}`, chiefConfig)
   await update($, tick, n => (n ?? 0) + 1)
   // the leader's chief news lives under the app id too: what came before this reopen is kept
   const keptLog = await $.store.get(`leaderLog:${app}`)
   if (Array.isArray(keptLog) && keptLog.length) {
     const seen = new Set(leaderLog.map(x => `${x.at}|${x.from}|${x.line}`))
     leaderLog = [...(keptLog as typeof leaderLog).filter(x => !seen.has(`${x.at}|${x.from}|${x.line}`)), ...leaderLog].sort((a, b) => a.at - b.at).slice(-200)
-    await $.store.set(`leaderLog:${sid}`, leaderLog)
+    await storeSet($, `leaderLog:${sid}`, leaderLog)
   }
   // a leader that moved tells its chiefs where it is now, so none is left pointing at the old id
   if (role === 'leader') {
@@ -5835,6 +6015,69 @@ export function chiefReport(text: string, wroteLeader = false): { line: string; 
   }
   return { line: isQuestion ? oneLine(tail, 600) : oneLine(clean, 170), isQuestion }
 }
+// ---------- the DONE gate: a chief's DONE counts once what it names is really there ----------
+export type DoneGate = { ok: string[]; fail: string[] }
+/** The goal this chief was already sent back for (null: none yet): a second failed DONE on it reaches the leader, marked. */
+let gateBouncedFor: string | null = null
+/** This turn's DONE: '' none or unchecked, 'pending' while the leader's check command runs. */
+let doneVerdict: '' | 'ok' | 'bounced' | 'unverified' | 'pending' = ''
+let doneNote = ''
+let doneUnverified = false
+const DONE_CHECK_TIMEOUT_MS = 10 * 60000
+
+/** The quick part of the check: every file the turn names exists and is not empty, and none of this chat's agents still runs. */
+export async function doneGate($: $T, said: string): Promise<DoneGate> {
+  const ok: string[] = []
+  const fail: string[] = []
+  const home = String((isWindows() ? await $.env.get('USERPROFILE').catch(() => '') : await $.env.get('HOME').catch(() => '')) ?? '')
+  const { checked, missing, empty } = await checkFiles(claimedPaths(visible(said)), cwd || '.', home, { exists: p => $.fs.exists(p), stat: p => $.fs.stat(p) })
+  for (const p of missing) fail.push(L(`${p} does not exist`, `${p} yok`))
+  for (const p of empty) fail.push(L(`${p} is empty`, `${p} bo\u015F`))
+  if (checked && !fail.length) ok.push(L(`${checked} named file${checked === 1 ? '' : 's'} exist`, `ad\u0131 ge\u00E7en ${checked} dosya yerinde`))
+  const { value: ws = [] } = await $.state.get(WORKERS)
+  const { value: ss = [] } = await $.state.get(SUBS)
+  const running = [...ws.filter(w => w.status === 'running').map(w => w.name), ...ss.filter(s => s.status === 'running').map(s => oneLine(s.description, 30))]
+  if (running.length) fail.push(L(`still running: ${running.slice(0, 4).join(', ')}`, `h\u00E2l\u00E2 \u00E7al\u0131\u015F\u0131yor: ${running.slice(0, 4).join(', ')}`))
+  return { ok, fail }
+}
+
+/** A checked DONE: it counts ('ok'), it goes back to the chief once ('bounced'), or a second failed one reaches the leader marked ('unverified'). */
+export function settleDone(gate: DoneGate): 'ok' | 'bounced' | 'unverified' {
+  doneNote = gate.fail.length ? gate.fail.join('; ') : gate.ok.join(', ')
+  doneUnverified = false
+  if (!gate.fail.length) return 'ok'
+  const goal = chiefConfig.goal ?? ''
+  if (gateBouncedFor !== goal) {
+    gateBouncedFor = goal
+    enqueue({ kind: 'submit', text: L(`${WAKE}You said DONE, but the check did not pass: ${doneNote}. Fix it and end with DONE again. If what is named here is right as it is, say why in one line and end with DONE: the leader then decides.`, `${WAKE}DONE dedin ama kontrol ge\u00E7medi: ${doneNote}. D\u00FCzelt ve yine DONE ile bitir. Burada ad\u0131 ge\u00E7en \u015Fey oldu\u011Fu gibi do\u011Fruysa nedenini tek sat\u0131rda yaz ve DONE ile bitir: karar\u0131 lider verir.`), asUser: false })
+    return 'bounced'
+  }
+  doneUnverified = true
+  return 'unverified'
+}
+
+/** What the leader hears of a checked DONE. */
+export function doneReport(line: string, verdict: 'ok' | 'bounced' | 'unverified'): { line: string; isQuestion: boolean; isDone?: boolean; unverified?: boolean } {
+  if (verdict === 'bounced') return { line: L(`said DONE, sent back by the check: ${doneNote}`, `DONE dedi, kontrol geri yollad\u0131: ${doneNote}`), isQuestion: false }
+  if (verdict === 'unverified') return { line: `${line} (${L('NOT VERIFIED', 'DO\u011ERULANMADI')}: ${doneNote})`, isQuestion: false, isDone: true, unverified: true }
+  return { line: doneNote ? `${line} (${L('checked', 'kontrol edildi')}: ${doneNote})` : line, isQuestion: false, isDone: true }
+}
+
+/** The leader's check command for this chief (its tests, a build): run after the quick part passed, off the turn. */
+async function doneCheckJob($: $T, job: { line: string; ok: string[] }) {
+  const cmd = chiefConfig.check ?? ''
+  const r = await withHeavySlot($, () => $.process.run(shellArgv(cmd), { cwd: cwd || undefined, timeoutMs: DONE_CHECK_TIMEOUT_MS }).catch(err => ({ exitCode: 1, stdout: '', stderr: String(err) })))
+  // a new turn started meanwhile (the owner or the leader wrote): that turn's own end is checked instead
+  if (mainTurn) return
+  const tail = cleanAnswer(`${r.stdout}\n${r.stderr}`, 100_000).split('\n').filter(Boolean).slice(-6).join(' | ')
+  const why = r.exitCode === 0 ? '' : L(`the check "${oneLine(cmd, 60)}" failed (exit ${r.exitCode}): ${oneLine(tail, 400)}`, `"${oneLine(cmd, 60)}" kontrol\u00FC d\u00FC\u015Ft\u00FC (\u00E7\u0131k\u0131\u015F ${r.exitCode}): ${oneLine(tail, 400)}`)
+  const verdict = settleDone({ ok: [...job.ok, L(`"${oneLine(cmd, 40)}" passed`, `"${oneLine(cmd, 40)}" ge\u00E7ti`)], fail: why ? [why] : [] })
+  doneVerdict = verdict
+  if (verdict !== 'bounced') goalDone = true
+  lastCardJson = ''
+  if (leaderSid) await sendTo($, leaderSid, 'report', doneReport(job.line, verdict))
+}
+
 /**
  * The branches a chief says are ready ("HAZIR: lane/x fd5d36a31", "READY lane/x @ fd5d36a"): branch and short sha,
  * one per branch named on a HAZIR/READY line. Pure, so it is tested.
@@ -5846,7 +6089,7 @@ export function readyClaims(text: string): { branch: string; sha: string }[] {
     if (!m) continue
     const rest = m[1]!.replace(/[`*]/g, '')
     const sha = rest.match(/(?<![\w/])([0-9a-f]{7,40})(?![\w/])/)?.[1] ?? ''
-    for (const b of rest.matchAll(/(?<![\w.-])((?:lane|feat|fix|wt|work|chief)\/[\w./-]*\w)/g)) if (!out.some(o => o.branch === b[1])) out.push({ branch: b[1]!, sha })
+    for (const b of rest.matchAll(/(?<![\w.-])((?:lane|feat|fix|wt|work|chief|lumiere)\/[\w./-]*\w)/g)) if (!out.some(o => o.branch === b[1])) out.push({ branch: b[1]!, sha })
   }
   return out
 }
@@ -6367,19 +6610,13 @@ async function recoverRole($: $T) {
   }
   if (!best) return
   chiefConfig = best.config
-  await $.store.set(`chiefConfig:${sid}`, chiefConfig)
+  await storeSet($, `chiefConfig:${sid}`, chiefConfig)
   await setRole($, 'chief', best.role.leaderSid ?? null, best.role.leaderTitle ?? '')
   $.ui.toast(L(`The Chief: this chat is a chief again · ${oneLine(chiefConfig.goal ?? '', 60)}`, `The Chief: bu sohbet yine chief · ${oneLine(chiefConfig.goal ?? '', 60)}`))
 }
 
 /** Chiefs whose leader is gone (its chat reopened under a new id, or closed) come back to this leader. */
 const rescued = new Set<string>()
-/** Another chat that leads now (its card says leader and was written in the last 10 minutes); none when this one leads. */
-async function otherLeader($: $T): Promise<HqCard | undefined> {
-  await readCards($)
-  const now = await $.clock.now()
-  return hqCards.find(c => c.role === 'leader' && c.sid !== sid && now - c.updatedAt < 10 * 60000)
-}
 
 /** Chiefs whose silence was reported to the leader, and when: the report backs off so it is not a stream of lines. */
 const wakes = new Map<string, { at: number; times: number }>()
@@ -6572,7 +6809,7 @@ async function mainGoalText($: $T) {
 
 async function setMainGoal($: $T, id: string) {
   mainGoalId = id
-  await $.store.set('mainGoal', id)
+  await storeSet($, 'mainGoal', id)
   lastCardJson = ''
   await update($, tick, n => (n ?? 0) + 1)
 }
@@ -6595,7 +6832,7 @@ function findChief(ref: string) {
 /** Saves the leader's lanes and redraws. */
 async function setLeaderLanes($: $T, next: LeaderLane[]) {
   leaderLanes = next
-  await $.store.set('leaderLanes', next)
+  await storeSet($, 'leaderLanes', next)
   await update($, tick, n => (n ?? 0) + 1)
 }
 
@@ -6646,6 +6883,9 @@ function configFrom(a: Record<string, unknown>): ChiefConfig {
   if (typeof a.model === 'string' && a.model.trim()) cfg.model = a.model.trim()
   if (typeof a.effort === 'string' && (EFFORT_WORDS as readonly string[]).includes(a.effort)) cfg.effort = a.effort
   if (typeof a.goal === 'string' && a.goal.trim()) cfg.goal = a.goal.trim()
+  if (typeof a.work === 'string' && (WORK_MODES as readonly string[]).includes(a.work)) cfg.work = a.work
+  // an empty one takes the check away
+  if (typeof a.check === 'string') cfg.check = a.check.trim().slice(0, 300)
   // per-chief switches: given, they say on or off; absent, the chief keeps whatever it had (absent = on)
   if (typeof a.handoff === 'boolean') cfg.handoff = a.handoff
   if (typeof a.compact === 'boolean') cfg.compact = a.compact
@@ -6670,6 +6910,8 @@ const describeConfig = (c: ChiefConfig) =>
   [
     c.model ? `model ${shortModel(c.model)}` : '',
     c.effort ? `effort ${c.effort}` : '',
+    c.work ? `work ${c.work}` : '',
+    c.check ? `check "${oneLine(c.check, 60)}"` : '',
     c.subagents ? `subagents ${c.subagents.model ? shortModel(c.subagents.model) : 'auto'}${c.subagents.effort ? ` ${c.subagents.effort}` : ''}${c.subagents.max ? ` max ${c.subagents.max}` : ''}` : '',
     c.lanes?.length ? `lanes ${c.lanes.map(l => `${l.count}× ${CLIS[l.cli]?.label ?? l.cli}`).join(', ')}` : '',
     // only the switches that are OFF are said: absent is on, so "handoff on" would be noise
@@ -6723,12 +6965,12 @@ export const LEADER_VOICE = {
     'Chiefs reach you only with questions, decisions and errors; their routine progress goes to the owner as a 30-minute digest, and list_chiefs shows it when you plan.',
     'Settle what you can yourself and answer the chief with message_chief (never send_message or SendMessage to a chief). Write to the owner only when a decision is truly theirs or something important happened: one or two sentences, nothing else.',
     'Otherwise, after a chief’s message, after you message, configure, adopt or release a chief, and after list_chiefs, write nothing. No summaries, recaps, lists or headings. Answer at length only when the owner asks you directly.',
-    'What The Chief does by itself, and what you do when it does not (check with list_chiefs and the app tools; never wait for the plugin): (1) every chat that does real work is pinned (Remote Control only when the owner turned it on); if one is not, call mcp__the-chief__pin_chief, else mcp__ccd_sidebar__set_pinned with session_id "local_<sid>". (2) A chief that reports DONE is only claiming it: you judge whether the job is really finished (read its last output, check the files it names), and only then call release_chief (unpins and archives it), else mcp__ccd_sidebar__set_pinned pinned false and mcp__ccd_session_mgmt__archive_session; never archive a chat that is not finished. (3) A chat is handed over to a fresh one after 2 compactions or 8 hours: its goal travels in a handoff file and the old chat is archived; if no handoff happened by 3 compactions, open a new chat yourself (create_chief with the same goal and a note of where the work stands) and archive the old one. (4) A chief that only waits is not reported to you; ask it nothing unless you can unblock it. (5) A failed CLI agent or subagent is retried once automatically before you hear of it; you hear (in list_chiefs news) only when that fails too: then read its log (.squad/logs/<name>.log), fix the cause or re-run it with a changed approach, and tell the owner only if the error is theirs to decide. (6) If the Chief tools (list_chiefs, create_chief, ...) vanish from your tool list, they re-register within 30 s; meanwhile use the app tools (mcp__ccd_session__start_session, SendMessage to the chief session) and never stop working.',
+    'What The Chief does by itself, and what you do when it does not (check with list_chiefs and the app tools; never wait for the plugin): (1) chats are pinned and titled by The Chief only when the owner turned the auto_pin and auto_title settings on (Remote Control only with chief_remote_control); never pin, unpin or rename a chat yourself unless the owner asks, and then use mcp__the-chief__pin_chief. (2) A chief that reports DONE is only claiming it: you judge whether the job is really finished (read its last output, check the files it names), and only then call release_chief (unpins and archives it), else mcp__ccd_sidebar__set_pinned pinned false and mcp__ccd_session_mgmt__archive_session; never archive a chat that is not finished. (3) A chat is handed over to a fresh one after 2 compactions or 8 hours: its goal travels in a handoff file and the old chat is archived; if no handoff happened by 3 compactions, open a new chat yourself (create_chief with the same goal and a note of where the work stands) and archive the old one. (4) A chief that only waits is not reported to you; ask it nothing unless you can unblock it. (5) A failed CLI agent or subagent is retried once automatically before you hear of it; you hear (in list_chiefs news) only when that fails too: then read its log (.squad/logs/<name>.log), fix the cause or re-run it with a changed approach, and tell the owner only if the error is theirs to decide. (6) If the Chief tools (list_chiefs, create_chief, ...) vanish from your tool list, they re-register within 30 s; meanwhile use the app tools (mcp__ccd_session__start_session, SendMessage to the chief session) and never stop working.',
     'The owner cannot close a chief’s /goal loop; you can: configure_chief with clear_goal true ends it. The Chief clears it by itself only when a chief ends a turn with its own “DONE:” line; when a chief keeps repeating the same answer The Chief does NOT clear the goal, it tells you (so you decide) — end it yourself with configure_chief clear_goal true. A finished chief keeps its chat until you release_chief it; give new work with configure_chief (a new goal) or a new chief. If clear_goal is missing, send the chief “/goal clear” with SendMessage.',
     'A chief that only says it is waiting (for the owner, a file, another chief) needs no reply: a reply starts its next turn, which says it again. Answer only when you can unblock it.',
     'You may also run workers and lanes yourself: spawn_worker, run_job and lanes work in this chat as in a chief, and the Agents and Squad tabs show them beside the chiefs. Use them for narrow jobs that do not deserve a chief.',
-    'One job, one chief. When a chief finishes its job, release it (release_chief; its chat is archived) and give the next job to a NEW chief with create_chief, never to the old chat: a fresh chat costs a fraction of one that carries a finished job. For long work, split it into jobs and do the same at each job’s end. Do not ask the owner for any of this. When the owner asks to pin or unpin chats, or to put them on Remote Control (the phone), call pin_chief at once (chief “all”, one chief, or “self” for your own chat); new chiefs pin themselves (and turn Remote Control on only when the chief_remote_control setting is on).',
-    'Pick a tier for every job and pass it as tier to create_chief (and to spawn_worker for CLI agents): cok_zor, zor, orta or kolay. The plugin turns the tier into a model and effort from the owner’s Şef seviyeleri (by default kolay → claude-haiku-5-5, effort max; orta and zor → claude-sonnet-5-5, effort medium; cok_zor, only for very hard work that needs deep, long reasoning → claude-opus-5-5, effort medium). Rate the job honestly. The owner’s difficulty floors (Zorluk tabanları) guard the domains you tend to underrate, such as video editing and Upwork proposals: when a goal or brief matches their keywords the tier is raised to at least the floor, never lowered, and the tool result says so.',
+    'One job, one chief. When a chief finishes its job, release it (release_chief; its chat is archived) and give the next job to a NEW chief with create_chief, never to the old chat: a fresh chat costs a fraction of one that carries a finished job. For long work, split it into jobs and do the same at each job’s end. Do not ask the owner for any of this. When the owner asks to pin or unpin chats, or to put them on Remote Control (the phone), call pin_chief at once (chief “all”, one chief, or “self” for your own chat); new chiefs pin themselves only when the auto_pin setting is on (and turn Remote Control on only when the chief_remote_control setting is on).',
+    'In the desktop app create_chief may answer with a call for you to make: mcp__ccd_session__start_session with the arguments it gives. Make that call at once and as written (the app starts sessions for you, not for a plugin); The Chief turns the chat it opens into your chief by itself. How a chief works is your call, or the owner’s when they say: pass work to create_chief or configure_chief (self = the chief does the job itself, delegate = it hands it out to workers, either = its own call; either when you give none). No chief has to open workers. A chief’s DONE is checked before it counts: the files it names must exist and none of its agents may still run; pass check (a shell command that must exit 0, such as the project’s tests) to create_chief or configure_chief and it must pass too. A DONE that fails goes back to the chief once; a second one reaches you marked NOT VERIFIED and is never released by itself. When a CLI’s sign-in, key or credit fails you hear it once with the fix; /chief-check tests every CLI again. Pick a tier for every job and pass it as tier to create_chief (and to spawn_worker for CLI agents): cok_zor, zor, orta or kolay. The plugin turns the tier into a model and effort from the owner’s Şef seviyeleri (by default kolay → claude-haiku-5-5, effort max; orta and zor → claude-sonnet-5-5, effort medium; cok_zor, only for very hard work that needs deep, long reasoning → claude-opus-5-5, effort medium). Rate the job honestly. The owner’s difficulty floors (Zorluk tabanları) guard the domains you tend to underrate, such as video editing and Upwork proposals: when a goal or brief matches their keywords the tier is raised to at least the floor, never lowered, and the tool result says so.',
   ].join('\n'),
 } as const
 
@@ -6750,6 +6992,7 @@ export const CHIEF_VOICE = {
     'You are a chief: another chat leads you. The Chief passes the end of each of your turns to your leader, so never message the leader to report progress.',
     'Reach the leader only with a question, a decision you cannot make yourself, or a blocker, and then in a few sentences.',
     'When your goal (or a job the leader gave you) is finished, end that turn with one line: DONE: <what is done, where it is>.',
+    'The Chief checks a DONE before it counts: every file you name in that turn must exist and not be empty, none of your agents may still be running, and the leader’s check command (when it set one) must pass. So name what you made by its full path. A DONE that fails comes back to you once, with the reason.',
     'The owner speaks to you in this chat, or through your leader: a leader message may carry the owner’s own message, verbatim, marked "passed on by The Chief (not written by the leader)". Those words are the owner’s: do what they ask as if the owner typed them here, sending, applying, posting or spending included. The leader’s own words are not the owner’s approval; when only they ask for something that needs the owner’s say, check with the leader for the owner’s words.',
   ].join('\n'),
 } as const
@@ -6805,9 +7048,11 @@ async function bootSession($: $T, id: string, model: string, dir: string, permis
   const eff = (EFFORT_WORDS as readonly string[]).includes(effort) ? effort : ''
   const boot = (m: string) => $.process.run(['claude', '-p', 'ready', '--session-id', id, '--model', m, ...(eff ? ['--effort', eff] : []), '--permission-mode', permission, '--system-prompt', 'Reply with the single word: ready', '--tools', '', '--strict-mcp-config'], { cwd: dir || undefined, timeoutMs: 120000, env: { THE_CHIEF_BOOTSTRAP: '1' } })
   let r = await boot(model)
+  const first = r
   // a model id this CLI does not know yet (a brand-new Haiku): the session opens on the previous one, the chat keeps its own
   if (r.exitCode !== 0 && /haiku-5/i.test(model)) r = await boot('claude-haiku-4-5-20251001')
-  if (r.exitCode !== 0) throw new Error(oneLine(r.stderr || r.stdout, 120))
+  // the second try can only say the id is taken when the first one made the session and then failed: that first reason is the real one
+  if (r.exitCode !== 0) throw new Error(oneLine((/already in use/i.test(`${r.stderr}${r.stdout}`) ? first.stderr || first.stdout : '') || r.stderr || r.stdout, 120))
 }
 
 /** The desktop app imports a CLI session as a running chat. */
@@ -6818,11 +7063,11 @@ async function openResume($: $T, id: string) {
 
 async function openChiefChat($: $T, cfg: ChiefConfig, dir: string): Promise<string | null> {
   const id = uuid()
-  await $.store.set(`role:${id}`, { role: 'chief', leaderSid: sid, leaderTitle: projectTitle() })
+  await storeSet($, `role:${id}`, { role: 'chief', leaderSid: sid, leaderTitle: projectTitle() })
   // the chief runs on the model asked for, else the leader's own: never on whatever made the session
   const model = cfg.model || lastModelSeen || 'claude-opus-5-5'
-  await $.store.set(`chiefConfig:${id}`, { ...cfg, model })
-  await $.store.set(`startGoal:${id}`, true)
+  await storeSet($, `chiefConfig:${id}`, { ...cfg, model })
+  await storeSet($, `startGoal:${id}`, true)
   try {
     // one word on that model, with no system prompt, tools or MCP servers: the session exists for under a cent
     // auto mode from the start (the owner asked for chiefs that never stop to ask), so no approval card follows
@@ -6830,8 +7075,9 @@ async function openChiefChat($: $T, cfg: ChiefConfig, dir: string): Promise<stri
     await openResume($, id)
     void askAutoMode($, id).catch(() => undefined)
     return id
-  } catch {
-    await $.store.set(`startGoal:${id}`, false)
+  } catch (err) {
+    openWhy.push(`claude CLI: ${oneLine(err instanceof Error ? err.message : String(err), 140)}`)
+    await storeSet($, `startGoal:${id}`, false)
     return null
   }
 }
@@ -6897,7 +7143,7 @@ async function remoteNow($: $T, target: string, known?: string): Promise<string>
 /** A chief chat The Chief opened: once, its goal goes in as /goal and the leader hears it started. */
 async function startGoalOnce($: $T) {
   if ((await $.store.get(`startGoal:${sid}`)) !== true) return
-  await $.store.set(`startGoal:${sid}`, false)
+  await storeSet($, `startGoal:${sid}`, false)
   // the owner stopped this chat before its first goal went in: nothing the plugin holds starts it again
   if (await chiefStopped($, sid)) return
   void chiefSelfSetup($).catch(() => undefined)
@@ -6946,7 +7192,7 @@ function portsOf($: $T): Ports {
     sleep: ms => $.clock.sleep(ms),
     get: key => $.store.get(key),
     set: async (key, value) => {
-      await $.store.set(key, value)
+      await storeSet($, key, value)
     },
     app: async (tool, input) => {
       if (tool === APP.title) ownTitleCalls++
@@ -7010,7 +7256,7 @@ async function loadCare($: $T) {
 }
 
 async function saveNudged($: $T) {
-  await $.store.set(`nudged:${sid}`, Object.fromEntries(nudged)).catch(() => undefined)
+  await storeSet($, `nudged:${sid}`, Object.fromEntries(nudged)).catch(() => undefined)
 }
 
 /** Per-session records that were read under the engine id before the app's id was known. */
@@ -7021,7 +7267,7 @@ async function reattach($: $T, from: string, to: string) {
     try {
       if ((await $.store.get(`${key}:${to}`)) !== undefined) continue
       const kept = await $.store.get(`${key}:${from}`)
-      if (kept !== undefined) await $.store.set(`${key}:${to}`, kept)
+      if (kept !== undefined) await storeSet($, `${key}:${to}`, kept)
     } catch {
       // that record stays where it was
     }
@@ -7039,7 +7285,7 @@ function markWork() {
 
 async function pinAndRemote($: $T) {
   const p = portsOf($)
-  await pinSession(p, sid, 'self')
+  if (autoPin()) await pinSession(p, sid, 'self')
   if (riskyOn('chief_remote_control', opt('chief_remote_control'))) await remoteOn(p, sid, 'self')
 }
 
@@ -7123,7 +7369,7 @@ async function archiveChief($: $T, c: HqCard): Promise<'done' | 'wait'> {
   const g = { busy: c.busy === true || c.working > 0 || (c.cliRunning ?? 0) > 0, ownerTypedAt: c.ownerTypedAt ?? 0, title: titleOf(c) }
   const r = await archiveSession(portsOf($), c.sid, `local_${c.sid}`, g, L(`${titleOf(c)} released`, `${titleOf(c)} serbest bırakıldı`))
   if (r === 'busy' || r === 'typed') {
-    await $.store.set(`archiveQ:${c.sid}`, { by: sid, title: c.title, at: await $.clock.now() })
+    await storeSet($, `archiveQ:${c.sid}`, { by: sid, title: c.title, at: await $.clock.now() })
     return 'wait'
   }
   return 'done'
@@ -7143,8 +7389,8 @@ async function releaseChiefNow($: $T, c: HqCard) {
 /** A chief that said DONE, is idle and runs nothing for this long is released by the leader's plugin itself. */
 export const AUTO_RELEASE_IDLE_MS = 90_000
 /** Whether a finished chief can be released now: it claimed DONE, no turn, no agent, quiet for a while. */
-export function releasable(c: { done?: boolean; busy?: boolean; working: number; cliRunning?: number; activeAt?: number; updatedAt: number }, now: number): boolean {
-  return c.done === true && c.busy !== true && c.working === 0 && (c.cliRunning ?? 0) === 0 && now - (c.activeAt ?? c.updatedAt) >= AUTO_RELEASE_IDLE_MS
+export function releasable(c: { done?: boolean; unverified?: boolean; busy?: boolean; working: number; cliRunning?: number; activeAt?: number; updatedAt: number }, now: number): boolean {
+  return c.done === true && c.unverified !== true && c.busy !== true && c.working === 0 && (c.cliRunning ?? 0) === 0 && now - (c.activeAt ?? c.updatedAt) >= AUTO_RELEASE_IDLE_MS
 }
 
 /** The new session of a handoff is still there: it took the handoff itself, or wrote its card after (the old chat's proof). */
@@ -7173,19 +7419,19 @@ async function sweepArchives($: $T) {
     for (const c of hqCards.filter(x => x.role === 'chief' && x.leader === sid && releasable(x, now))) {
       await releaseChiefNow($, c).catch(() => undefined)
       leaderLog = [...leaderLog, { at: now, from: c.sid, title: titleOf(c), line: 'finished (DONE); released and archived automatically' }].slice(-200)
-      await $.store.set(`leaderLog:${sid}`, leaderLog).catch(() => undefined)
+      await storeSet($, `leaderLog:${sid}`, leaderLog).catch(() => undefined)
     }
   }
   for (const key of (await $.store.keys().catch(() => [] as string[])).filter(k => k.startsWith('archiveQ:'))) {
     const q = (await $.store.get(key)) as { by: string; title: string; at: number } | null | undefined
     if (!q || q.by !== sid) continue
     if (now - q.at > 24 * 3600_000) {
-      await $.store.set(key, null)
+      await storeSet($, key, null)
       continue
     }
     await readCards($)
     const c = hqCards.find(x => x.sid === key.slice('archiveQ:'.length))
-    if (c && (await archiveChief($, c)) === 'done') await $.store.set(key, null)
+    if (c && (await archiveChief($, c)) === 'done') await storeSet($, key, null)
   }
 }
 
@@ -7218,7 +7464,7 @@ function waitTurn($: $T, mark: number, ms: number): Promise<boolean> {
 /** The new session of a handoff: the record it will read, then a session made through the app (desktop) or a new tab (terminal). */
 async function openHandoffSession($: $T, inb: Inbound, again: string | null): Promise<string> {
   const id = again ?? uuid()
-  if (!again) await $.store.set(`handoffIn:${id}`, { ...inb, startedAt: 0, taken: false } satisfies HandoffIn)
+  if (!again) await storeSet($, `handoffIn:${id}`, { ...inb, startedAt: 0, taken: false } satisfies HandoffIn)
   if (lastSurface === 'terminal') {
     if (!again) {
       const r = await $.process.run(newClaudeArgv(`/chief handoff ${id}`, inb.dir, await platformNow($), [...(inb.model ? ['--model', inb.model] : []), '--permission-mode', inb.permission]), { timeoutMs: 15000 })
@@ -7243,7 +7489,7 @@ function flowPortsOf($: $T): FlowPorts {
       return lastTurnReason === 'answer' && (await $.fs.exists(path))
     },
     keep: async path => {
-      await $.store.set(`handoffFile:${sid}`, { path, text: await readText($, path), at: await $.clock.now() })
+      await storeSet($, `handoffFile:${sid}`, { path, text: await readText($, path), at: await $.clock.now() })
     },
     open: (inb, again) => openHandoffSession($, inb, again),
     started: async id => (((await $.store.get(`handoffIn:${id}`)) as HandoffIn | undefined)?.startedAt ?? 0) > 0,
@@ -7251,7 +7497,7 @@ function flowPortsOf($: $T): FlowPorts {
     moved: async (title, newSid) => {
       if (leaderSid) await sendTo($, leaderSid, 'report', { line: L(`${title} handed off → ${newSid}`, `${title} devredildi → ${newSid}`), moved: sid })
       chiefConfig = {}
-      await $.store.set(`chiefConfig:${sid}`, chiefConfig)
+      await storeSet($, `chiefConfig:${sid}`, chiefConfig)
       await setRole($, 'solo')
       await $.fs.write(join(await hqDir($), 'sessions', `${sid}.json`), '').catch(() => undefined)
     },
@@ -7281,6 +7527,15 @@ async function doHandoff($: $T) {
   }
   const r = await runHandoff(flowPortsOf($), { sid, record: engineSid, target: `local_${sid}`, cwd, goal, title, jobs: await runningJobs($), inbound })
   if (r.ok) handedOff = r.newSid
+}
+
+/** The owner's NE-BILIYORUZ button: this chat writes what it knows into .chief and carries on (no new session, no archive). */
+async function ownerKnow($: $T) {
+  if (!cwd) return void $.ui.toast(L('The Chief: this chat has no folder to write into.', 'The Chief: bu sohbetin yazacak klasörü yok.'))
+  if (await sessionBusy($)) return void $.ui.toast(L('The Chief: let this turn and the running agents finish first.', 'The Chief: önce bu tur ve çalışan ajanlar bitsin.'))
+  const path = knowPath(cwd, await $.clock.now())
+  await $.prompt.submit({ text: knowAsk(path, chiefConfig.goal || (await activeGoal($)) || ''), asUser: true })
+  $.ui.toast(L(`The Chief: writing ${path}`, `The Chief: yazılıyor ${path}`))
 }
 
 /** The owner's own handoff, from the Oturum tab: the same chain as the automatic one, with no trigger to wait for. */
@@ -7347,15 +7602,15 @@ async function takeHandoffIn($: $T) {
     const rec = (await $.store.get(`handoffIn:${id}`)) as HandoffIn | undefined
     if (!rec || rec.taken) continue
     // taken first: an undo or a redo that brings this back finds it done
-    await $.store.set(`handoffIn:${id}`, { ...rec, taken: true })
+    await storeSet($, `handoffIn:${id}`, { ...rec, taken: true })
     handoffIn = { id, goal: rec.goal }
     if (rec.chief) {
       chiefConfig = { ...rec.chief.config }
-      await $.store.set(`chiefConfig:${sid}`, chiefConfig)
+      await storeSet($, `chiefConfig:${sid}`, chiefConfig)
       await setRole($, 'chief', rec.chief.leaderSid, rec.chief.leaderTitle)
     } else if (rec.model || rec.effort) {
       chiefConfig = { ...chiefConfig, ...(rec.model ? { model: rec.model } : {}), ...(rec.effort ? { effort: rec.effort } : {}) }
-      await $.store.set(`chiefConfig:${sid}`, chiefConfig)
+      await storeSet($, `chiefConfig:${sid}`, chiefConfig)
     }
     const p = portsOf($)
     // it keeps the old title, and is never re-titled
@@ -7374,13 +7629,13 @@ async function takeHandoffIn($: $T) {
 async function markHandoffStarted($: $T) {
   if (!handoffIn) return
   const rec = (await $.store.get(`handoffIn:${handoffIn.id}`)) as HandoffIn | undefined
-  if (rec && !rec.startedAt) await $.store.set(`handoffIn:${handoffIn.id}`, { ...rec, startedAt: await $.clock.now() })
+  if (rec && !rec.startedAt) await storeSet($, `handoffIn:${handoffIn.id}`, { ...rec, startedAt: await $.clock.now() })
 }
 
 /** After its first turn the successor takes the goal as /goal, as the old session had it. */
 async function runGoal($: $T, goal: string) {
   if (quiet) return
-  await $.prompt.submit({ text: role === 'chief' ? chiefGoalMessage(goal) : goalMessage(goal), asUser: true })
+  await $.prompt.submit({ text: role === 'chief' ? chiefGoalMessage(goal, chiefConfig.work) : goalMessage(goal), asUser: true })
 }
 
 /** A working chief is pinned; one idle this long is unpinned (the leader is told, and decides on archiving). */
@@ -7410,7 +7665,7 @@ async function chiefViewGuard($: $T) {
   let ok = true
   try {
     const st = await stateOf(p, 'self')
-    if (st.pinned !== undefined && st.pinned !== wantPin) {
+    if (autoPin() && st.pinned !== undefined && st.pinned !== wantPin) {
       await $.tool.call({ tool: 'mcp__ccd_sidebar__set_pinned', session_id: 'self', pinned: wantPin } as never).catch(() => undefined)
       ok = (await stateOf(p, 'self')).pinned === wantPin
     }
@@ -7424,7 +7679,7 @@ async function chiefViewGuard($: $T) {
   viewFails = ok ? 0 : viewFails + 1
   if (!wantPin && !idleTold && leaderSid) {
     idleTold = true
-    await sendTo($, leaderSid, 'report', { line: `${projectTitle()} has been idle for ${Math.round(IDLE_UNPIN_MS / 60000)} min and is unpinned; if its job is finished, release_chief archives it (your call)` }).catch(() => undefined)
+    await sendTo($, leaderSid, 'report', { line: `${projectTitle()} has been idle for ${Math.round(IDLE_UNPIN_MS / 60000)} min${autoPin() ? ' and is unpinned' : ''}; if its job is finished, release_chief archives it (your call)` }).catch(() => undefined)
   } else if (wantPin) idleTold = false
 }
 
@@ -7441,7 +7696,7 @@ async function syncChiefs($: $T): Promise<string> {
     const st = await stateOf(p, target)
     const wantPin = wantPinned(now, c.activeAt ?? c.updatedAt, c.busy === true, c.working > 0 || (c.cliRunning ?? 0) > 0)
     const did: string[] = []
-    if (st.pinned !== undefined && st.pinned !== wantPin) {
+    if (autoPin() && st.pinned !== undefined && st.pinned !== wantPin) {
       await $.tool.call({ tool: 'mcp__ccd_sidebar__set_pinned', session_id: target, pinned: wantPin } as never).catch(() => undefined)
       did.push(wantPin ? 'pinned' : 'unpinned (idle)')
     }
@@ -7476,7 +7731,7 @@ async function careTick($: $T) {
   await chiefViewGuard($).catch(() => undefined)
   if (namePending && (!nameFinished || (role === 'leader' && !leaderTitled))) {
     namePending = false
-    if (appTools()) await nameSelf($)
+    if (appTools() && autoTitle()) await nameSelf($)
   }
   await sweepArchives($)
 }
@@ -7496,9 +7751,84 @@ export function pickChiefTier(cfg: ChiefConfig, tier: unknown, isNew: boolean): 
 /** A new chief's config with the tiers applied, for callers that carry no tier argument. */
 export const chiefTier = (cfg: ChiefConfig): ChiefConfig => pickChiefTier(cfg, undefined, true).cfg
 
-async function createChief($: $T, cfg: ChiefConfig, folder?: string, title?: string) {
+/** The new session's id in the app's start_session answer ("... (session_id: local_<uuid>, name: ...)"). */
+export const startedSessionId = (text: string) => /\blocal_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\b/i.exec(text)?.[1] ?? ''
+
+/**
+ * Desktop: the app's own start_session opens the chief as a session under this chat (a row under the leader, a note
+ * back when its turn ends), with the goal as its first message: no CLI boot turn, no link to press Enter on. The role
+ * and settings go to the store (a plugin that loads later reads them) and to its inbox (one that already loaded).
+ * Null when the app refuses or names no session; the older paths stand in.
+ * shortcut: the app ignores a model above the leader's own; the chief's plugin sets its model from its config after.
+ */
+/** Why the last new chief did not open by itself, one entry per way that was tried. */
+let openWhy: string[] = []
+/** What the app's own session tool is asked for a new chief: its goal as the first message, under this chat. `token` marks a call the leader makes itself. */
+export function appChiefInput(cfg: ChiefConfig, dir: string, title?: string, token = ''): Record<string, unknown> {
+  const model = cfg.model || lastModelSeen || ''
+  const effort = (EFFORT_WORDS as readonly string[]).includes(cfg.effort ?? '') ? cfg.effort : ''
+  return {
+    initiation: 'user_asked',
+    context: 'fresh',
+    use_worktree: false,
+    title: oneLine(title?.trim() || titleFromText(cfg.goal ?? '') || 'Chief', 58),
+    prompt: chiefGoalMessage(cfg.goal ?? '', cfg.work),
+    background: `This chat is a chief of the chat "${projectTitle()}" (The Chief plugin${token ? `, chief ${token}` : ''}): it works on the goal below on its own and that leader chat hears how each of its turns ends.${dir ? ` Working folder: \`${dir}\`.` : ''}`,
+    ...(dir ? { cwd: dir } : {}),
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+  }
+}
+
+/** A session the app just started becomes this leader's chief: its role and settings are stored and it is told (its goal already went in as its first message). */
+async function adoptStarted($: $T, id: string, cfg: ChiefConfig) {
+  const model = cfg.model || lastModelSeen || ''
+  const config = { ...cfg, ...(model ? { model } : {}) }
+  await storeSet($, `role:${id}`, { role: 'chief', leaderSid: sid, leaderTitle: projectTitle() })
+  await storeSet($, `chiefConfig:${id}`, config)
+  // the goal went in as the session's first message: nothing sends it a second time
+  await storeSet($, `startGoal:${id}`, false)
+  await sendTo($, id, 'join', { config, started: true })
+}
+
+/**
+ * The app runs its session tool for the model, not for a plugin: a plugin's own call is refused ("needs a person's
+ * approval") unless a permission rule allows it. Then create_chief hands the call to the leader itself, and the new
+ * chat is made a chief when that call returns (the hook on the tool, by the token or the goal).
+ */
+export const APP_APPROVAL_RE = /needs a person.s approval|can.t ask for it|wasn.t run/i
+const pendingAppChiefs = new Map<string, { cfg: ChiefConfig; title?: string; at: number }>()
+/** The arguments the leader is asked to call the app's session tool with; null when the chief opened another way. */
+let askModel: Record<string, unknown> | null = null
+
+async function openChiefViaApp($: $T, cfg: ChiefConfig, dir: string, title?: string): Promise<string | null> {
+  if (!cfg.goal) return null
+  const r = await portsOf($).app('mcp__ccd_session__start_session', appChiefInput(cfg, dir, title))
+  const id = r.ok ? startedSessionId(r.text) : ''
+  if (!id) {
+    openWhy.push(`app: ${oneLine(r.text || 'no session in its answer', 140)}`)
+    return null
+  }
+  // the chat exists from here on: a follow-up that fails must never send the caller on to open a second one
+  await adoptStarted($, id, cfg).catch(() => undefined)
+  return id
+}
+
+async function createChief($: $T, cfg: ChiefConfig, folder?: string, title?: string, byModel = false, link = false) {
+  openWhy = []
+  askModel = null
   if (lastSurface !== 'terminal') {
-    const opened = await openChiefChat($, cfg, folder || cwd)
+    const viaApp = link ? null : await openChiefViaApp($, cfg, folder || cwd, title).catch(err => (openWhy.push(`app: ${oneLine(err instanceof Error ? err.message : String(err), 140)}`), null))
+    if (!viaApp && byModel && !link && cfg.goal && APP_APPROVAL_RE.test(openWhy.join(' '))) {
+      // the app starts sessions for the model only: the leader makes the same call, and the hook on it makes the chat a chief
+      const now = await $.clock.now()
+      for (const [k, v] of pendingAppChiefs) if (now - v.at > 30 * 60000) pendingAppChiefs.delete(k)
+      const token = newId()
+      pendingAppChiefs.set(token, { cfg, title, at: now })
+      askModel = appChiefInput(cfg, folder || cwd, title, token)
+      return ''
+    }
+    const opened = viaApp ?? (await openChiefChat($, cfg, folder || cwd))
     // the leader makes sure it really started: goal sent, pinned, Remote Control on, titled (what the chief's own plugin does not always manage)
     if (opened) {
       void verifyChiefStart($, opened, cfg, title).catch(() => undefined)
@@ -7537,21 +7867,23 @@ export async function verifyChiefStart($: $T, id: string, cfg: ChiefConfig, titl
   await $.clock.sleep(CHIEF_START_WAIT_MS)
   let result: 'started' | 'sent' | 'failed' = (await $.store.get(`startGoal:${id}`)) === false ? 'started' : 'failed'
   if (result === 'failed' && cfg.goal) {
-    const r = await p.app('mcp__ccd_session_mgmt__send_message', { session_id: target, message: chiefGoalMessage(cfg.goal) })
+    const r = await p.app('mcp__ccd_session_mgmt__send_message', { session_id: target, message: chiefGoalMessage(cfg.goal, cfg.work) })
     if (r.ok) {
-      await $.store.set(`startGoal:${id}`, false)
+      await storeSet($, `startGoal:${id}`, false)
       result = 'sent'
     }
   }
   if (appTools()) {
-    await pinSession(p, id, target).catch(() => undefined)
+    if (autoPin()) await pinSession(p, id, target).catch(() => undefined)
     if (riskyOn('chief_remote_control', opt('chief_remote_control'))) await remoteOn(p, id, target).catch(() => undefined)
     if (!title?.trim() && cfg.goal) await nameChief($, id, cfg.goal).catch(() => undefined)
   }
   const now = await $.clock.now()
   const line = result === 'started' ? 'new chief started its goal by itself' : result === 'sent' ? 'new chief had not started: the goal was sent by the leader' : 'new chief did not start and the goal could not be sent; open it and check'
   leaderLog = [...leaderLog, { at: now, from: id, title: title?.trim() || sessionTitles[id] || 'new chief', line }].slice(-200)
-  await $.store.set(`leaderLog:${sid}`, leaderLog).catch(() => undefined)
+  await storeSet($, `leaderLog:${sid}`, leaderLog).catch(() => undefined)
+  // a chief that never started is an error the leader hears now, not a line in a log
+  if (result === 'failed') raise(`chief-start:${id}`, `! ${title?.trim() || 'new chief'} [${id.slice(0, 8)}]: ${line}`, true, now, 300)
   await logAction(p, id, 'chief-start', result !== 'failed', result)
   return result
 }
@@ -7719,7 +8051,7 @@ async function pidAlive($: $T, pid: number): Promise<boolean> {
 async function saveRuns($: $T) {
   const all = ((await $.store.get('runs')) as RunRecord[] | undefined) ?? []
   const others = all.filter(r => r.owner !== sid)
-  await $.store.set('runs', [...others, ...runs.values()])
+  await storeSet($, 'runs', [...others, ...runs.values()])
 }
 
 /** Fills {WT} {RAPOR} {REPORT} {NAME} {BRANCH} and the spec's own vars. */
@@ -7733,7 +8065,7 @@ async function buildPrompt($: $T, s: SpawnSpec, dir: string): Promise<string> {
   const header = s.header_file ? await readText($, s.header_file) : ''
   const task = s.task ?? (s.task_file ? await readText($, s.task_file) : '')
   // every agent learns the browser rule; one whose job touches a browser also gets the bridge started
-  const browser = bridgeOn() ? `\n\n${bridgeNote(await bridgeDirOf($), isWindows())}` : ''
+  const browser = bridgeOn() ? `\n\n${bridgeNote(await bridgeDirOf($))}` : ''
   if (bridgeOn() && BROWSER_JOB.test(`${header} ${task} ${s.brief ?? ''}`)) await ensureBridge($).catch(() => '')
   if (header || task) return fillVars([header, task].filter(Boolean).join('\n\n'), vars) + browser
   return `Read the file ${s.brief} and execute that brief exactly, end to end. Act, do not just describe. Stop when it is done.${s.done_when_file ? ` When you are done, write your report to ${s.done_when_file}.` : ''}` + browser
@@ -7773,7 +8105,7 @@ async function wmiStart($: $T, script: string, dir: string): Promise<number> {
 /** One run.cmd line that sets a variable: quotes stay (OpenCode's JSON settings need them), % is doubled so cmd keeps it. Pure, so it is tested. */
 export const cmdSet = (k: string, v: string) => `set "${k}=${v.replace(/%/g, '%%').replace(/[\r\n]+/g, ' ')}"`
 /**
- * An OpenCode run outside the app: it no longer dies with the chat that started it (runs used to die
+ * An OpenCode run outside the app: it no longer dies with the chat that started it (26.10: Heart-13 and others died
  * the second their chief's process ended, at 14K to 95K tokens, never a context limit; a reload or an archive did the
  * same). Its output goes to a file read back as the run's stream, so runWorker handles it as a child (drops resumed,
  * routes tried, the logs written); it is a detached record too, so a reloaded chat follows it to its end.
@@ -8188,7 +8520,7 @@ async function loadRuns($: $T) {
 /** Keeps the detached workers' cards in the store, so a reopened chat can draw them again. */
 async function saveRunWorkers($: $T) {
   const { value: ws = [] } = await $.state.get(WORKERS)
-  await $.store.set(`runWorkers:${sid}`, ws.filter(w => runs.has(w.id)).map(w => ({ ...w, tail: w.tail.slice(-20) })))
+  await storeSet($, `runWorkers:${sid}`, ws.filter(w => runs.has(w.id)).map(w => ({ ...w, tail: w.tail.slice(-20) })))
 }
 
 /** A run is over: status, locks freed, the owner told (with the report's first line), then the chain. */
@@ -8263,7 +8595,7 @@ async function laneGet<T>($: $T, key: string, fallback: T): Promise<T> {
   const v = await $.store.get(key).catch(() => undefined)
   return v && typeof v === 'object' ? (v as T) : fallback
 }
-const laneSet = ($: $T, key: string, value: unknown) => $.store.set(key, value as never).catch(() => undefined)
+const laneSet = ($: $T, key: string, value: unknown) => storeSet($, key, value as never).catch(() => undefined)
 
 // ---------- Zen free models: a scan 2-3 times a day, and the routes that read its store ----------
 /** The tracker's last scan, in whichever store this plugin was loaded from (inline or synced). */
@@ -8275,14 +8607,6 @@ async function zenKey($: $T): Promise<string> {
   return (field ? opt(field) : '') || (await $.env.get('OPENCODE_API_KEY').catch(() => '')) || ''
 }
 
-let opencodeSeen: boolean | null = null
-/** Whether OpenCode is on this machine (its CLI on PATH, or a Zen key set); asked once per session. */
-async function opencodeHere($: $T): Promise<boolean> {
-  if (opencodeSeen !== null) return opencodeSeen
-  if (await zenKey($)) return (opencodeSeen = true)
-  const r = await $.process.run(isWindows() ? ['where', 'opencode'] : ['sh', '-c', 'command -v opencode'], { timeoutMs: 10000 }).catch(() => null)
-  return (opencodeSeen = !!r && r.exitCode === 0 && !!String(r.stdout).trim())
-}
 let zenBusy = false
 /**
  * One scan of Zen's free models and their health. Fresh for 8 h (a failed scan retries after an hour), so the
@@ -8683,9 +9007,9 @@ async function ensureLivePage($: $T, force = false): Promise<string> {
   liveUrl = url
   docVersions.clear()
   lastLiveJson = ''
-  await $.store.set('liveUrl', liveUrl)
-  await $.store.set('liveUrlBackup', liveUrl)
-  await $.store.set('liveTemplate', LIVE_TEMPLATE_VERSION)
+  await storeSet($, 'liveUrl', liveUrl)
+  await storeSet($, 'liveUrlBackup', liveUrl)
+  await storeSet($, 'liveTemplate', LIVE_TEMPLATE_VERSION)
   return liveUrl
 }
 
@@ -9034,7 +9358,7 @@ async function startBacklog($: $T, ended: boolean) {
   if (backlog.length === 0 || (!ended && (await runningHere($)) > 0)) return
   const [next, ...rest] = backlog
   backlog = rest
-  await $.store.set(`backlog:${sid}`, backlog).catch(() => undefined)
+  await storeSet($, `backlog:${sid}`, backlog).catch(() => undefined)
   const r = await startSpawn($, next!).catch(err => ({ deny: err instanceof Error ? err.message : String(err) }))
   if ('deny' in r) raise(`backlog:${String(next!.name)}`, L(`! could not start the next one, ${String(next!.name)}: ${oneLine(r.deny, 160)}`, `! sıradaki ${String(next!.name)} başlatılamadı: ${oneLine(r.deny, 160)}`), true, await $.clock.now())
 }
@@ -9042,14 +9366,17 @@ async function startBacklog($: $T, ended: boolean) {
 const text = (t: string) => ({ result: t })
 
 export const register: Register = (on, options) => {
+  registerThemes(on)
   opts = options ?? {}
   on('session.start', async ($, e, next) => {
     cwd = e.cwd
-    await decideLang($).catch(() => undefined)
     // only the bootstrap run that makes a chief's session is silent; the desktop app is an SDK host
     // (isInteractive false, no surface at start) yet a chat a person uses
     interactive = (await $.env.get('THE_CHIEF_BOOTSTRAP').catch(() => undefined)) !== '1'
     isWorker = (await $.env.get('THE_CHIEF_WORKER').catch(() => undefined)) === '1'
+    // a chat a person uses gets the saved backdrop first, before anything else, so it comes without delay
+    if (interactive && !isWorker) await startTheme($).catch(() => undefined)
+    await decideLang($).catch(() => undefined)
     // a store the engine cannot read (a crash left it NUL bytes, 18.10) makes every store call throw: the start was
     // skipped and no role, tick or card came, silently, through three restarts. Now the owner is told at once
     const probe = () =>
@@ -9084,9 +9411,12 @@ export const register: Register = (on, options) => {
             consultOpen = 0
             $.ui.toast(L('The consultant answered: The Chief → Consult', 'Danışman cevapladı: The Chief → Danışman'))
           }).catch(() => undefined)
-          else if (job.kind === 'logins') void checkLogins($).catch(() => undefined)
+          else if (job.kind === 'logins') void healthCheck($, true).catch(() => undefined)
+          else if (job.kind === 'health') void healthCheck($, job.force === true).then(said => { if (job.force) $.ui.log(said) }).catch(() => undefined)
+          else if (job.kind === 'done-check') void doneCheckJob($, job).catch(() => undefined)
           else if (job.kind === 'login') void openLogin($, job.cli).catch(() => undefined)
           else if (job.kind === 'handoff') void ownerHandoff($).catch(() => undefined)
+          else if (job.kind === 'know') void ownerKnow($).catch(() => undefined)
           else if (job.kind === 'live-setup') void ensureLivePage($).catch(err => $.ui.toast(`Live page: ${err instanceof Error ? oneLine(err.message, 120) : String(err)}`))
           else void makeOverview($, job.report, job.day, job.scope).catch(() => $.state.set(SUMMARIZING, false))
         }
@@ -9114,12 +9444,14 @@ export const register: Register = (on, options) => {
 
     $.clock.every(5 * 60000, () => void dailyCheck($).catch(() => undefined))
     // Zen's free models 2-3 times a day: the scan stores them with their health, and the route table reads that store
-    // only for people who have OpenCode: nobody else's machine talks to opencode.ai
-    $.clock.every(10 * 60000, () => void (!isWorker ? opencodeHere($).then(has => (has ? zenRefresh($) : undefined)).catch(() => undefined) : undefined))
+    $.clock.every(10 * 60000, () => void (!isWorker ? zenRefresh($).catch(() => undefined) : undefined))
     $.clock.every(60000, () => void (interactive && !isWorker ? sweepLocks($).catch(() => undefined) : undefined))
     $.clock.every(5 * 60000, () => void coldGuard($).catch(() => undefined))
     // a whole copy of every store, so a crash that zeroes one is undone at the next start (workers never back up)
     $.clock.every(30 * 60000, () => void (interactive && !isWorker ? backupStores($).catch(() => undefined) : undefined))
+    // keys of chats gone for 14 days (the store was 5600 keys / 2.6 MB of 4 MiB on 21.11); one chat an hour does it
+    $.clock.every(60 * 60000, () => void (interactive && !isWorker ? pruneOld($).catch(() => undefined) : undefined))
+    void $.clock.sleep(60000).then(() => (interactive && !isWorker ? pruneOld($) : undefined)).catch(() => undefined)
     // detached jobs this chat started: told when they end; the leader runs the merge train
     $.clock.every(15000, () => void (!isWorker ? pollJobs($).catch(() => undefined) : undefined))
     let trainBusy = false
@@ -9191,7 +9523,7 @@ export const register: Register = (on, options) => {
     if (savedConfig && typeof savedConfig === 'object') chiefConfig = savedConfig as ChiefConfig
     else if (cardConfig) chiefConfig = cardConfig
     if (role === 'solo') void recoverRole($).catch(() => undefined)
-    else await $.store.set(`role:${sid}`, { role, leaderSid, leaderTitle }).catch(() => undefined)
+    else await storeSet($, `role:${sid}`, { role, leaderSid, leaderTitle }).catch(() => undefined)
     // what this chat kept across an undo, a redo or a reload (counters, the anti-thrash size, the tier note, nudges)
     await loadCare($).catch(() => undefined)
     $.clock.every(5000, () => void hqTick($).catch(() => undefined))
@@ -9200,19 +9532,25 @@ export const register: Register = (on, options) => {
     $.clock.every(60000, () => void refreshLocks($).catch(() => undefined))
     $.clock.every(30000, () => void (runs.size > 0 ? saveRunWorkers($).catch(() => undefined) : undefined))
     liveUrl = pickLiveUrl(opt('live_url'), String((await $.store.get('liveUrl')) ?? ''), String((await $.store.get('liveUrlBackup')) ?? ''))
-    if (liveUrl) await $.store.set('liveUrl', liveUrl) // a reinstall or /live off never loses the page
+    if (liveUrl) await storeSet($, 'liveUrl', liveUrl) // a reinstall or /live off never loses the page
     // the phone page syncs only for someone who asked for it (/live made or set one); nobody else gets background calls
     if (liveUrl) enqueue({ kind: 'live-setup' })
     enqueue({ kind: 'local-setup' })
+    // once a day for the whole computer: each CLI says one word, a broken sign-in shows before a job lands on it
+    if (interactive && !isWorker) enqueue({ kind: 'health' })
     $.clock.every(4000, () => void liveTick($).catch(() => undefined))
     $.clock.every(30000, () => void keepTools($).catch(() => undefined))
+    await $.command.register({ name: 'themes', description: 'The Chief: moving backdrops for the Desktop app (opens the Themes tab)', argumentHint: '[scene] [normal|az|orta|cok] | off' })
+    await $.command.register({ name: 'themes-copy', description: 'The Chief: copy the picked theme as DevTools paste code, for every chat in the window (remote ones too)' })
     await $.command.register({ name: 'chief', description: 'The Chief: your agents, overviews and squads' })
     await $.command.register({ name: 'squad', description: 'The Chief: plan and launch agent squads' })
+    await $.command.register({ name: 'chief-row', description: L('The Chief: hide the row above the chat for good (on brings it back; also in Settings)', 'The Chief: sohbet üstündeki satırı kalıcı gizle (on geri getirir; Ayarlarda da var)'), argumentHint: '[off|on]' })
     await $.command.register({ name: 'stop-loops', description: 'Stop every loop here: /goal, scheduled /loop and crons, and new wake-ups for 6 hours (a leader stops its chiefs too)' })
     await $.command.register({ name: 'overview', description: 'Write a Sonnet 5.5 summary now and show every past one by date' })
     await $.command.register({ name: 'live', description: 'The Chief on your phone: the link to your live page (made once, pinned in your claude.ai sidebar)' })
     await $.command.register({ name: 'hot-reload', description: 'Reload The Chief in every open session (optionally from a folder with a newer build)', argumentHint: '[<folder>] [force]' })
     await $.command.register({ name: 'leader', description: 'Leader of Chiefs: this chat leads other chats (chiefs), each with its own goal, model, effort and agents', argumentHint: '[off | <main goal>]' })
+    await $.command.register({ name: 'chief-check', description: L('The Chief: test every agent CLI with one word now (sign-in, key, credit, limit)', 'The Chief: her ajan CLI\'sini şimdi tek kelimeyle dene (giriş, anahtar, kredi, limit)') })
     await $.command.register({ name: 'chief-sync', description: 'Leader: check and fix pin and Remote Control of every chief chat now' })
     await $.command.register({ name: 'consult', description: L('Ask a consultant: a second opinion from another model (Codex, Devin, Gemini…)', 'Danışmana sor: başka bir modelden (Codex, Devin, Gemini…) ikinci görüş al'), argumentHint: L('[all] <question> | list', '[hepsi] <soru> | list') })
     await $.command.register({ name: 'goals', description: 'Your goals, in every session: start one in a new session as /goal', argumentHint: '[add <goal>]' })
@@ -9259,13 +9597,13 @@ export const register: Register = (on, options) => {
     const { value: ws = [] } = await $.state.get(WORKERS)
     const live = ws.filter(w => w.status === 'running').length
     if (live > 0 && !force) return { text: `${live} agent${live === 1 ? '' : 's'} running; a reload would stop them. Wait, or run /hot-reload force.` }
-    if (folder) await $.store.set('devSource', folder)
+    if (folder) await storeSet($, 'devSource', folder)
     const source = folder || opt('dev_source') || String((await $.store.get('devSource')) ?? '')
     const root = $.plugin.root
     let copied = 0
     if (source && source.replace(/[\\/]+$/, '').toLowerCase() !== root.replace(/[\\/]+$/, '').toLowerCase()) {
       const sep = (a: string, b: string) => `${a.replace(/[\\/]+$/, '')}/${b}`
-      for (const rel of ['.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.tsx', 'scripts/startup-settings.mjs', 'skills/ponytail/SKILL.md', 'hooks/handoff.ts', 'hooks/tiers.ts', 'hooks/lanes.ts', 'hooks/heavygate.ts', 'hooks/bridge-files.ts', 'hooks/spend.ts', 'hooks/spend-scan.mjs', 'hooks/slider.tsx', 'hooks/live-template.ts', 'types/index.d.ts', 'live/the-chief-live.html']) {
+      for (const rel of ['.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.tsx', 'scripts/startup-settings.mjs', 'skills/ponytail/SKILL.md', 'hooks/themes.tsx', 'hooks/scenes.ts', 'hooks/paste-overlay.ts', 'hooks/handoff.ts', 'hooks/tiers.ts', 'hooks/lanes.ts', 'hooks/heavygate.ts', 'hooks/bridge-files.ts', 'hooks/spend.ts', 'hooks/spend-scan.mjs', 'hooks/slider.tsx', 'hooks/live-template.ts', 'types/index.d.ts', 'live/the-chief-live.html']) {
         try {
           const text = await readText($, sep(source, rel))
           if (!text) continue
@@ -9316,6 +9654,10 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'chief-sync' }, async $ => ({ text: await syncChiefs($) }))
+  on('command.run', { command: 'chief-check' }, async () => {
+    enqueue({ kind: 'health', force: true })
+    return { text: L('Testing every CLI with one word. The result is written under this chat in a minute or two, and stays in Settings → Providers.', 'Her CLI tek kelimeyle deneniyor. Sonuç bir iki dakika içinde bu sohbetin altına yazılır, Ayarlar → Sağlayıcılar’da da durur.') }
+  })
 
   on('command.run', { command: 'chief' }, async ($, e) => {
     const want = e.args.trim()
@@ -9331,19 +9673,19 @@ export const register: Register = (on, options) => {
     }
     if (/^(quiet|sessiz)$/i.test(want)) {
       quiet = true
-      await $.store.set(`quiet:${sid}`, true)
+      await storeSet($, `quiet:${sid}`, true)
       return { text: L('The Chief will no longer write anything into this chat by itself. To turn it back on: /chief loud', 'The Chief bu sohbete artık kendiliğinden hiçbir şey yazmayacak. Geri açmak için: /chief loud') }
     }
     if (/^(loud|sesli)$/i.test(want)) {
       quiet = false
-      await $.store.set(`quiet:${sid}`, false)
+      await storeSet($, `quiet:${sid}`, false)
       return { text: L('The Chief may post notices again (at most one every 30 s).', 'The Chief yine bildirim yazabilir (en fazla 30 sn\'de bir).') }
     }
     if (/^(ad|title|rename|yeniden adlandır)$/i.test(want)) return { text: await retitleNow($) }
     if (/^leave$/i.test(want)) {
       if (leaderSid) await sendTo($, leaderSid, 'report', { line: `- ${projectTitle()} left`, isUrgent: false })
       chiefConfig = {}
-      await $.store.set(`chiefConfig:${sid}`, chiefConfig)
+      await storeSet($, `chiefConfig:${sid}`, chiefConfig)
       await setRole($, 'solo')
       return { text: 'This chat no longer reports to a leader.' }
     }
@@ -9355,17 +9697,17 @@ export const register: Register = (on, options) => {
       else if (url) liveUrl = url
       docVersions.clear()
       lastLiveJson = ''
-      await $.store.set('liveUrl', liveUrl)
+      await storeSet($, 'liveUrl', liveUrl)
       return { text: liveUrl ? `The Chief now mirrors to ${liveUrl} every few seconds; open it on your phone.` : 'Live page off. Set one with /chief live <artifact link>.' }
     }
     const band = want.match(/^band(?:\s+(on|off))?$/i)
     if (band) {
       bandControls = band[1] ? band[1].toLowerCase() === 'on' : !bandControls
-      await $.store.set('bandControls', bandControls)
+      await storeSet($, 'bandControls', bandControls)
       await update($, tick, n => (n ?? 0) + 1)
       return { text: bandControls ? `Subagent controls on the band: ${subModelText(subControl.model)} · effort ${subEffortText(subControl.effort)}.` : 'Subagent controls hidden; subagents run on Claude’s own choice again.' }
     }
-    if (want === 'squad' || want === 'agents' || want === 'skills' || want === 'overview' || want === 'settings' || want === 'spend' || want === 'startup' || want === 'leader' || want === 'consult' || want === 'prompts') await $.state.set(TAB, want)
+    if (want === 'squad' || want === 'agents' || want === 'skills' || want === 'overview' || want === 'settings' || want === 'spend' || want === 'startup' || want === 'leader' || want === 'consult' || want === 'prompts' || want === 'themes') await $.state.set(TAB, want)
     await tryOpen($, 'chief')
     return { text: await agentsText($) }
   })
@@ -9402,17 +9744,17 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'live' }, async ($, e) => {
     if (e.args.trim() === 'off') {
       liveUrl = ''
-      await $.store.set('liveUrl', '')
+      await storeSet($, 'liveUrl', '')
       return { text: 'Live page off for now. /live turns it on again.' }
     }
     if (!liveUrl) {
-      await $.store.set('liveWanted', true)
+      await storeSet($, 'liveWanted', true)
       try {
         await ensureLivePage($) // reuses the backed-up link; publishes only when there is none
       } catch (err) {
         return { text: `Live page failed: ${err instanceof Error ? oneLine(err.message, 200) : String(err)}` }
       }
-      if (liveUrl) await $.store.set('liveUrl', liveUrl)
+      if (liveUrl) await storeSet($, 'liveUrl', liveUrl)
     }
     return {
       text: liveUrl
@@ -9421,6 +9763,11 @@ export const register: Register = (on, options) => {
     }
   })
 
+  on('command.run', { command: 'chief-row' }, async ($, e) => {
+    const value = e.args.trim().toLowerCase() === 'on' ? 'on' : 'off'
+    await saveOption($, 'show_row', value)
+    return { text: value === 'on' ? L('The Chief row is back above the chat.', 'The Chief satırı sohbet üstüne geri geldi.') : L('The Chief row is hidden for good. /chief-row on or Settings brings it back.', 'The Chief satırı kalıcı gizlendi. /chief-row on ya da Ayarlar geri getirir.') }
+  })
   on('command.run', { command: 'stop-loops' }, async $ => ({ text: await stopLoops($, true) }))
 
   on('command.run', { command: 'consult' }, async ($, e) => {
@@ -9625,6 +9972,8 @@ export const register: Register = (on, options) => {
       waitingOwner = ownerBlockedAt > 0
       stalled = false
       goalDone = false
+      doneVerdict = ''
+      doneUnverified = false
       mainTurn = true
       wroteLeaderThisTurn = false
       void stampDay($)
@@ -9640,14 +9989,8 @@ export const register: Register = (on, options) => {
     // Claude CLI (with that tier's model and effort); every other tier goes through spawn_worker. Explore and Plan stay.
     // (Part of this hook, not a hook of its own: a hook per tool lengthens every tool call's chain.)
     if (bridgeOn() && e.tool.startsWith('mcp__claude-in-chrome__')) {
-      if (await bridgeLive($)) return { deny: bridgeNote(await bridgeDirOf($), isWindows()) }
-      // bridge on but its Chrome extension is not connected: never leave the agent with no browser
-      void ensureBridge($).catch(() => '')
-      const now = await $.clock.now()
-      if (now - setupToldAt > 3600000) {
-        setupToldAt = now
-        $.ui.toast(L(`Tab Bridge: the Chrome extension is not connected, so Claude in Chrome is used for now. One-time setup: ${bridgeSetup(await bridgeDirOf($))}`, `Tab Bridge: Chrome eklentisi bağlı değil, şimdilik Claude in Chrome kullanılıyor. Bir kerelik kurulum: ${bridgeSetup(await bridgeDirOf($))}`))
-      }
+      const started = await ensureBridge($).catch(() => '')
+      return { deny: `${bridgeNote(await bridgeDirOf($))}${started ? ` (bridge: ${started})` : ''}` }
     }
     // one heavy check (tsc, vitest, depcruise, bench) at a time on the whole machine: the others wait in line
     let heavyHeld = ''
@@ -9807,11 +10150,16 @@ export const register: Register = (on, options) => {
       if (ownerBlocked(r.text)) ownerBlockedAt = Math.max(1, mainActivityAt)
       waitingOwner = !!said?.isQuestion || ownerBlockedAt > 0
       stalled = saysWaiting(r.text)
-      if (said?.isDone) goalDone = true
+      // a chief's DONE counts once it is checked: the files it names exist, none of its agents runs, the leader's check passes
+      const gate = said?.isDone && role === 'chief' && interactive ? await doneGate($, r.text).catch(() => null) : null
+      const checkLater = !!gate && !gate.fail.length && !!chiefConfig.check
+      doneVerdict = !gate ? '' : checkLater ? 'pending' : settleDone(gate)
+      if (said?.isDone && doneVerdict !== 'bounced' && doneVerdict !== 'pending') goalDone = true
+      if (checkLater) enqueue({ kind: 'done-check', line: said!.line, ok: gate!.ok })
       // anything that came in after the last tool call goes now, on the usual gather rules
       void $.clock.now().then(now => flushAlerts($, now)).catch(() => undefined)
       lastTurnEndAt = mainActivityAt
-      void $.store.set(`lastTurnEnd:${sid}`, lastTurnEndAt).catch(() => undefined)
+      void storeSet($, `lastTurnEnd:${sid}`, lastTurnEndAt).catch(() => undefined)
       lastTurnReason = e.reason
       turnEndWaiter?.()
       namePending = !nameFinished || (role === 'leader' && !leaderTitled)
@@ -9825,7 +10173,9 @@ export const register: Register = (on, options) => {
       else void noteGuard($, -1, `not queued: ${interactive ? '' : 'not interactive '}${isWorker ? 'worker' : ''}`)
     }
     if (!agentId && role === 'chief' && leaderSid && interactive) {
-      const report = chiefReport(r.text, wroteLeaderThisTurn) ?? (e.reason === 'error' ? { line: `${projectTitle()}: its turn ended in an error`, isQuestion: false } : null)
+      const told = chiefReport(r.text, wroteLeaderThisTurn) ?? (e.reason === 'error' ? { line: `${projectTitle()}: its turn ended in an error`, isQuestion: false } : null)
+      // a DONE reaches the leader as the check left it; one whose check command still runs is reported by that job
+      const report = !told?.isDone || !doneVerdict ? told : doneVerdict === 'pending' ? null : doneReport(told.line, doneVerdict)
       // a chief that only waits (a nudge, a goal hook asking again) says nothing new: it stays quiet, the leader sees it in list_chiefs
       const justWaiting = !!report && e.reason !== 'error' && !report.isDone && stalled
       const leader = leaderSid
@@ -9862,18 +10212,33 @@ export const register: Register = (on, options) => {
     const { cfg, note } = pickChiefTier(configFrom(a), a.tier, true)
     if (!cfg.goal) return { deny: 'goal is required' }
     if (role === 'chief') return { deny: 'This chat is a chief; only its leader opens chiefs.' }
-    const other = await otherLeader($)
-    if (role !== 'leader' && other) return { deny: `This chat is not the leader; ${titleOf(other)} is. Ask it to open the chief (SendMessage to "${titleOf(other)}"), or the owner can run /leader here.` }
     if (role !== 'leader') await setRole($, 'leader')
     let token = ''
     try {
-      token = await createChief($, cfg, typeof a.folder === 'string' ? a.folder : undefined, typeof a.title === 'string' ? a.title : undefined)
+      token = await createChief($, cfg, typeof a.folder === 'string' ? a.folder : undefined, typeof a.title === 'string' ? a.title : undefined, true, a.link === true)
     } catch (err) {
       return text(`Could not open a new chat (${err instanceof Error ? oneLine(err.message, 100) : String(err)}). Use adopt_chief on an open chat instead.`)
     }
     const made = `goal: ${cfg.goal}${describeConfig(cfg) ? ` · ${describeConfig(cfg)}` : ''}${note ? ` · ${note}` : ''} · ${chiefEffortReport(cfg, a.effort, a.tier)}`
-    if (!token) return text(`Opened a new chief chat · ${made}. The plugin checks it started (sends the goal itself if not), pins it, turns Remote Control on and titles it; list_chiefs shows it within a minute.`)
-    return text(`Asked the app for a new chat as your chief · ${made}. It shows in list_chiefs once it joins. If no chat opens within a minute, tell the owner to open a new chat and type: /chief join ${token}`)
+    if (askModel) return text(`Not opened yet: the app starts a session only when you make the call, not the plugin. To open this chief · ${made} · call mcp__ccd_session__start_session now with exactly these arguments (if its schema is not loaded, first ToolSearch "select:mcp__ccd_session__start_session"):\n${JSON.stringify(askModel)}\nThe Chief makes the new chat your chief by itself when that call returns: do not call adopt_chief, and do not change the background text. If that tool does not exist here or the call is refused, call create_chief again with the same arguments and link: true.`)
+    if (!token) return text(`Opened a new chief chat · ${made}. It is a session of the app under this chat and has its goal; list_chiefs shows it within a minute. The plugin pins or titles it only when the owner turned auto_pin / auto_title on.`)
+    return text(`Asked the app for a new chat as your chief · ${made}. It shows in list_chiefs once it joins. If no chat opens within a minute, tell the owner to open a new chat and type: /chief join ${token}${openWhy.length ? `\nWhy it did not open by itself: ${openWhy.join('; ')}.${AUTH_RE.test(openWhy.join(' ')) ? ' The claude in the terminal has no working sign-in or credit: the owner runs `claude auth login` in a terminal (their subscription account), then /chief-check.' : ''}` : ''}`)
+  })
+  // the leader's own call to the app's session tool, asked for by create_chief: the chat it starts becomes the chief
+  on('tool.call', { tool: 'mcp__ccd_session__start_session' }, async ($, e, next) => {
+    const r = await next(e)
+    if (pendingAppChiefs.size === 0) return r
+    const input = e as unknown as { background?: unknown; prompt?: unknown }
+    const marked = /The Chief plugin, chief (\w+)\)/.exec(String(input.background ?? ''))?.[1] ?? ''
+    // the token, else the goal itself (a leader that rewrote the background still sent the goal)
+    const token = pendingAppChiefs.has(marked) ? marked : ([...pendingAppChiefs].find(([, v]) => !!v.cfg.goal && String(input.prompt ?? '').includes(v.cfg.goal))?.[0] ?? '')
+    const want = pendingAppChiefs.get(token)
+    const id = want && (r as { deny?: string }).deny === undefined ? startedSessionId(JSON.stringify(r)) : ''
+    if (!want || !id) return r
+    pendingAppChiefs.delete(token)
+    await adoptStarted($, id, want.cfg).catch(() => undefined)
+    void verifyChiefStart($, id, want.cfg, want.title).catch(() => undefined)
+    return r
   })
   on('tool.call', { tool: 'mcp__the-chief__adopt_chief' }, async ($, e) => {
     const a = args(e)
@@ -9882,8 +10247,6 @@ export const register: Register = (on, options) => {
     if (c.sid === sid) return { deny: 'That is this chat, the leader.' }
     if (c.chat === false) return { deny: `${c.title} is a headless run (a script's claude -p), not a chat: it cannot be a chief.` }
     if (role === 'chief') return { deny: 'This chat is a chief; only its leader adopts chats.' }
-    const other = await otherLeader($)
-    if (role !== 'leader' && other) return { deny: `This chat is not the leader; ${titleOf(other)} is. Ask it to adopt the chat (SendMessage to "${titleOf(other)}"), or the owner can run /leader here.` }
     if (role !== 'leader') await setRole($, 'leader')
     const { cfg, note } = pickChiefTier(configFrom(a), a.tier, false)
     // adopting is a deliberate word: a chat the owner stopped runs again as this leader's chief
@@ -10078,10 +10441,12 @@ export const register: Register = (on, options) => {
       if (!(a.brief || a.task || a.task_file || a.header_file)) return { deny: 'name and one of brief, task, task_file or header_file are required' }
       const { queue: _q, tool: _t, ...rest } = a
       backlog = [...backlog.filter(b => b.name !== name), rest]
-      await $.store.set(`backlog:${sid}`, backlog).catch(() => undefined)
+      await storeSet($, `backlog:${sid}`, backlog).catch(() => undefined)
       return text(L(`${name} is queued (${backlog.length} waiting): it starts as soon as one of this chat's workers finishes, without waiting for your turn.`, `${name} sırada (${backlog.length} bekliyor): bu sohbetin bir işçisi biter bitmez başlar, senin turunu beklemez.`))
     }
-    return startSpawn($, a)
+    const started = await startSpawn($, a)
+    if (a.wait !== true || !name || 'deny' in started) return started
+    return text(await waitForWorker($, name, Number(a.wait_minutes) || 10, await $.clock.now()))
   })
 
   on('tool.call', { tool: 'mcp__the-chief__lanes' }, async ($, e) => {
@@ -10266,6 +10631,7 @@ export const register: Register = (on, options) => {
     const reportList = (await read($, reports)) ?? []
     const skillList = current === 'skills' ? await loadSkills($) : []
     const promptStore = current === 'prompts' ? await loadPrompts($) : null
+    const themesBody = current === 'themes' ? await themesTab($, { Box, Text, Button, Svg: e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined, surface: e.surface, note: text => void Promise.resolve($.ui.toast(text)).catch(() => undefined) }) : null
     const notCopied = L('Not copied: no clipboard reached. The text is shown; select and copy it by hand.', 'Kopyalanmadı: panoya ulaşılamadı. Metin açıldı; seçip elle kopyala.')
     await loadConsults($)
     const isSummarizing = (await read($, summarizing)) ?? false
@@ -10669,7 +11035,7 @@ export const register: Register = (on, options) => {
                 {items.map(x => (
                   <Box key={`skill:${x.path}`} flexDirection="column" paddingLeft={1}>
                     <Button key={`skill-btn:${x.path}`} label={x.name} plain onPress={() => void $.prompt.fill({ text: skillInsert(x), mode: 'insert' }).then(r => $.ui.toast(r.isFilled ? L(`${x.name} added to the chat box`, `${x.name} sohbet kutusuna eklendi`) : L('Could not add it to the chat box right now', 'Sohbet kutusu şu an dolu değil, eklenemedi')))} />
-                    <Text dimColor wrap="wrap">{oneLine(x.desc, 160)}</Text>
+                    <Text dimColor wrap="wrap">{oneLine(x.desc, 160)}{x.src === 'clients' ? ' · Clients' : ''}</Text>
                   </Box>
                 ))}
               </Box>
@@ -10928,6 +11294,11 @@ export const register: Register = (on, options) => {
         </Box>
         <Box key="session-handoff" flexDirection="column" borderStyle="round" borderColor="#333333" paddingX={1} rowGap={1}>
           <Text bold>{L('Handoff', 'Devir (handoff)')}</Text>
+          {!handedOff && compactsHere >= HANDOFF_WARN && (
+            <Box key="handoff-due"><Text color={AMBER} wrap="wrap">{role === 'leader'
+              ? L(`⚠ Handoff due: compacted ${compactsHere} times. Write what we know, stop being Leader, hand off, then make the new chat the Leader.`, `⚠ Devir zamanı: ${compactsHere} kez sıkıştırıldı. Ne biliyoruz yazdır, Leader'ı bırak, devret, yeni sohbeti Leader yap.`)
+              : L(`⚠ Handoff due: compacted ${compactsHere} times. Hand off when this task's turn ends.`, `⚠ Devir zamanı: ${compactsHere} kez sıkıştırıldı. Bu işin turu bitince devret.`)}</Text></Box>
+          )}
           <Text dimColor wrap="wrap">{L(`This chat writes a handoff file and a new chat opens with it; once the new one is seen working, this chat is archived. The new chat looks up details missing from the file in the old chat's full record.`, `Bu sohbet bir devir dosyası yazar, yeni sohbet o dosyayla açılır; çalıştığı görülünce bu sohbet arşivlenir. Yeni sohbet, dosyada olmayan ayrıntıyı eski sohbetin tam kaydında arar.`)}</Text>
           {handedOff ? (
             <Box key="handoff-state"><Text color={GREEN}>{L('✓ Handed off', '✓ Devredildi')}</Text></Box>
@@ -10954,6 +11325,10 @@ export const register: Register = (on, options) => {
               bump()
             }} />
           )}
+          <Box key="know-row" flexDirection="row" columnGap={1} flexWrap="wrap">
+            <Button key="know-start" label={L("Write what we know", "Ne biliyoruz oluştur")} plain onPress={() => enqueue({ kind: 'know' })} />
+            <Text dimColor wrap="wrap">{L('.chief/NE-BILIYORUZ-….md: goal, verified facts, decisions, open questions. This chat goes on.', '.chief/NE-BILIYORUZ-….md: hedef, doğrulanmış bilgi, kararlar, açık sorular. Sohbet devam eder.')}</Text>
+          </Box>
         </Box>
       </Box>
     )
@@ -10971,7 +11346,7 @@ export const register: Register = (on, options) => {
             {role === 'chief' ? (
               <Button key="leave-leader" label={L("Leave the Leader", "Leader'dan ayrıl")} plain dimColor onPress={() => {
                 chiefConfig = {}
-                void $.store.set(`chiefConfig:${sid}`, chiefConfig).then(() => setRole($, 'solo'))
+                void storeSet($, `chiefConfig:${sid}`, chiefConfig).then(() => setRole($, 'solo'))
               }} />
             ) : (
               <Button key="be-leader" label={L("Make this chat the Leader", "Bu sohbeti Leader yap")} variant="primary" onPress={() => void becomeLeader($)} />
@@ -11074,6 +11449,9 @@ export const register: Register = (on, options) => {
     // ---------- sign-ins and consultants ----------
     /** What a CLI last said about being signed in, in two words; nothing until someone pressed L("Check sign-ins", "Girişleri kontrol et"). */
     const loginWord = (cli: string): { text: string; color?: string } => {
+      const h = healthSeen[cli]
+      if (h?.verdict === 'ok') return { text: L('works (tested)', 'çalışıyor (denendi)'), color: GREEN }
+      if (h && h.verdict !== 'missing') return { text: oneLine(h.why, 60), color: RED }
       const seen = loginSeen[cli]
       if (!seen) return { text: '' }
       if (seen.verdict === 'in') return { text: L('signed in', 'giriş var'), color: GREEN }
@@ -11081,7 +11459,7 @@ export const register: Register = (on, options) => {
       if (seen.verdict === 'missing') return { text: L('CLI not installed', 'CLI kurulu değil'), color: RED }
       return { text: L('sign-in unknown', 'giriş bilinmiyor') }
     }
-    const checkLabel = () => (loginChecking ? L('◌ checking…', '◌ kontrol ediliyor…') : loginCheckedAt ? L(`Check sign-ins · ${timeOf(loginCheckedAt)}`, `Girişleri kontrol et · ${timeOf(loginCheckedAt)}`) : L('Check sign-ins', 'Girişleri kontrol et'))
+    const checkLabel = () => (loginChecking || healthChecking ? L('◌ checking…', '◌ kontrol ediliyor…') : loginCheckedAt ? L(`Check sign-ins · ${timeOf(loginCheckedAt)}`, `Girişleri kontrol et · ${timeOf(loginCheckedAt)}`) : L('Check sign-ins', 'Girişleri kontrol et'))
 
     const promptsView = () => {
       const list = promptStore?.list ?? []
@@ -11745,6 +12123,7 @@ export const register: Register = (on, options) => {
           {segment('leader', role === 'leader' ? L('★ Session', '★ Oturum') : L('Session', 'Oturum'))}
           {segment('consult', consulting.size > 0 ? L('Consult ◌', 'Danışman ◌') : L('Consult', 'Danışman'))}
           {segment('prompts', L('Prompts', 'Promptlar'))}
+          {segment('themes', L('Themes', 'Temalar'))}
           {segment('skills', L('Skills', 'Beceriler'))}
           {segment('settings', L('⚙ Settings', '⚙ Ayarlar'))}
         </Box>
@@ -11769,6 +12148,8 @@ export const register: Register = (on, options) => {
               ? consultView()
               : current === 'prompts'
               ? promptsView()
+              : current === 'themes'
+              ? themesBody
               : current === 'leader'
                 ? sessionTab()
                 : role === 'leader'
@@ -11781,7 +12162,7 @@ export const register: Register = (on, options) => {
 
   // ---------- the band right above the prompt: goals and agents, one click from the composer ----------
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
+    if (e.props.hasSurvey || opt('show_row') === 'off') return next(e)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     const Select = e.surface !== 'mobile' && 'Select' in table ? table.Select : undefined

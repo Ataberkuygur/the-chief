@@ -1,10 +1,10 @@
 /**
  * One gate for heavy commands (tsc, vitest, dependency-cruiser) on this machine. ffmpeg is not gated: it holds
- * 100-300 MB, and suspending it froze video exports for minutes.
+ * 100-300 MB, and suspending it froze Lumiere exports for minutes (24.10: mix, QC and engine stalls).
  *
  * The heavy.lock only covers Claude sessions' Bash tool; agent workers ran 3 tsc + 2 dependency-cruiser at once
- * (~12 GB), and chiefs' own batch scripts (nohup node run-batches.mjs, npx vitest from a shell whose parent is
- * gone) ran 27 vitest at once and froze the machine. So the gate looks at processes, whoever started them: a
+ * (~12 GB, 17.10), and chiefs' own batch scripts (nohup node run-batches.mjs, npx vitest from a shell whose parent is
+ * gone) ran 27 vitest at once and froze the machine (18.10). So the gate looks at processes, whoever started them: a
  * heavy command that does not fit in the RAM-based slots is suspended and resumed, oldest first, when one frees. To the
  * caller that is a command waiting on a lock. Everything here is pure, so it is tested.
  */
@@ -23,7 +23,7 @@ const AGENT_RE = /^(claude|opencode|qodercli|codex|devin|cursor-agent|gemini|agy
 const AGENT_CMD_RE = /claude-code|@anthropic-ai|opencode|qodercli|codex|cursor-agent/i
 /** A person's own terminal or editor: a heavy command under one of these (and no agent in between) is theirs. */
 const PERSON_RE = /^(explorer|WindowsTerminal|OpenConsole|wt|Code|Cursor|powershell_ise|idea64|devenv)(\.exe)?$/i
-/** True when the person started it: holding their own tsc froze their terminal. Orphans stay gated. */
+/** True when the person started it (their PowerShell froze when the gate held their own tsc, 20.11.2026). Orphans stay gated. */
 export function personOwned(byId: Map<number, GateProc>, p: GateProc): boolean {
   for (const a of ancestors(byId, p)) {
     if (AGENT_RE.test(a.name) || AGENT_CMD_RE.test(a.cmd)) return false

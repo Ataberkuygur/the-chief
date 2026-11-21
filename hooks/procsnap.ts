@@ -1,5 +1,5 @@
-// The machine's process list without WMI. Get-CimInstance calls can pile up (dozens of hung
-// powershells eat the RAM), so WMI is not used here. procsnap is a small C# program the plugin compiles once
+// The machine's process list without WMI. Get-CimInstance calls piled up on 19.10 (~50 hung powershells ate the RAM
+// and the laptop went down), so the owner banned WMI here. procsnap is a small C# program the plugin compiles once
 // with the csc of .NET Framework 4 (every Windows has it): Toolhelp32 for ids, parents and names, the process's own
 // handle for CPU, working set, start time and command line, GlobalMemoryStatusEx for available RAM. Nothing it calls
 // can hang on a service the way WMI does.

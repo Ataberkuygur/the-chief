@@ -84,7 +84,7 @@ pre.out { margin: 6px 0 0; background: #0d0d0d; border: 1px solid var(--line); b
     if (e === 'high') return { word: L('careful', 'dikkatli'), color: 'var(--amber)' };
     return { word: L('deep', 'derin'), color: 'var(--coral)' };
   };
-  const mascot = (color, size = 26) => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="${color}"/></svg>`;
+  const mascot = (color, size = 26) => `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8" fill="${color}"/></svg>`;
   const MARK = { running: '●', done: '✓', failed: '✗', stopped: '■' };
   const one = s => String(s || '').replace(/\s+/g, ' ').trim();
 

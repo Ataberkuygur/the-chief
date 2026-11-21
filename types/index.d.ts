@@ -147,7 +147,7 @@ export type SquadBudget = {
   spentTokens?: number
 }
 
-export type SquadTab = 'agents' | 'skills' | 'overview' | 'squad' | 'settings' | 'leader' | 'goals' | 'spend' | 'startup' | 'consult' | 'prompts'
+export type SquadTab = 'agents' | 'skills' | 'overview' | 'squad' | 'settings' | 'leader' | 'goals' | 'spend' | 'startup' | 'consult' | 'prompts' | 'themes'
 
 declare module 'claude-code' {
   interface PluginState {
@@ -171,6 +171,8 @@ declare module 'claude-code' {
       editingProvider: string | null
       /** Providers whose key was saved in this session (secrets are never read back). */
       savedKeys: string[]
+      /** The Themes tab's choice, "<scene>:<kind>:<frost 1|0>:<auto seconds>" or "off". */
+      themeChoice: string
       /** What every Claude subagent runs on, set from the band above the prompt. */
       subControl: SquadSubControl
       /** The band's budget row. */

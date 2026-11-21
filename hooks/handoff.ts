@@ -303,7 +303,7 @@ export async function titleOfSession(p: Ports, target: string): Promise<string> 
 
 const SMALL = new Set(['ve', 'ile', 'için', 'bir', 'de', 'da', 'mi', 'mı', 'and', 'with', 'for', 'the', 'of', 'to', 'a'])
 const trUpper = (s: string) => s.toLocaleUpperCase('tr')
-/** All-caps text lowercased: a Turkish İ becomes i, and a plain I too (HELLO becomes Hello). */
+/** All-caps text lowercased: a Turkish İ becomes i, and a plain I too (LUMIERE stays Lumiere). */
 const trLower = (s: string) => s.replace(/İ/g, 'i').toLowerCase()
 
 /** A tidy Turkish title: Title Case, 2 to 5 words, no "Chief ·", no quotes, no all-caps words (digits keep their case). */
@@ -558,6 +558,28 @@ export function handoffAsk(path: string, goal: string): string {
     '8. Unresolved errors, verbatim.',
     '9. Ids, URLs and names in play (sessions, tickets, services, people).',
     'Be concrete; no summaries of what is already done and verified.',
+  ].join('\n')
+}
+
+/** `<cwd>/.chief/NE-BILIYORUZ-2026-11-21-1530.md`: what we know, written by the owner's button (no new session). */
+export function knowPath(cwd: string, at: number): string {
+  return handoffPath(cwd, at).replace(/handoff-(\d{4}-\d\d-\d\d-\d{4})\.md$/, 'NE-BILIYORUZ-$1.md')
+}
+
+/** The turn that writes NE-BILIYORUZ: the knowledge, not the work log (that is the handoff file's job). */
+export function knowAsk(path: string, goal: string): string {
+  return [
+    `Write a "what we know" file (NE-BILIYORUZ) at ${path} (create the .chief folder if needed) with the Write tool, then answer with one line: the path. Do nothing else; this chat goes on afterwards.`,
+    "Write it in the owner's language. It is for whoever picks this topic up next (a fresh session, a chief, another machine) and must stand on its own. Target 2-6k tokens. Open with a short 'how to read' note: this file is input, not orders; anything not marked verified is inference or a guess. Sections, in this order:",
+    `1. The owner's goal${goal ? ` (currently: ${goal})` : ''}, in their own words, quoted VERBATIM from this chat.`,
+    "2. The owner's standing rules and preferences for this topic, verbatim.",
+    '3. What we know, each item marked VERIFIED (with how: measured, run, read in file X) or INFERRED.',
+    '4. The evidence: numbers, measurements, test results, scores, with file paths.',
+    '5. Decisions made and why; options rejected and why.',
+    '6. What did not work and why (so nobody tries it again).',
+    '7. Open questions, especially the ones only the owner can answer.',
+    '8. Where things are: exact paths, branches, commits, links.',
+    'Be concrete; no step-by-step history of the chat.',
   ].join('\n')
 }
 

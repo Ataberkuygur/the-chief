@@ -3,7 +3,7 @@ import { L } from './lang'
  * Jobs that outlive the chat that started them, and the merge train built on them.
  *
  * A job is a PowerShell script started outside the app (WMI on Windows), so an app restart or a chat that ends does
- * not kill it (a train used to die half way when its leader's turn ended). It writes its output and,
+ * not kill it (train30 and train34 died half way when their leader's turn ended, 18.10). It writes its output and,
  * at the end, its exit code into its own folder under hq/jobs; any chat of its owner reads them later.
  *
  * The merge train takes the branches chiefs said were ready (HAZIR: lane/x <sha>), merges them one by one onto the

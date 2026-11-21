@@ -273,7 +273,7 @@ export const modelText = (m: string) => (isFreeModel(m) ? `${m} (free)` : m)
 export type Route = { cli: string; model: string; effort: string; /** the provider keeps what it sees: never for private data */ keeps?: boolean }
 
 /**
- * The default routes, best first. Longcat runs on OpenCode Zen (`opencode/longcat-2.5-preview-free`): the OpenCode Go copy of it hangs.
+ * The owner's routes (16.10), best first. Longcat runs on OpenCode Zen (`opencode/longcat-2.5-preview-free`): the OpenCode Go copy of it hangs.
  * Zen's free models may keep what they see, so they carry `keeps`. A CLI that hit its limit is skipped, so the next entry runs. OpenCode Go's
  * free DeepSeek V4.1 Flash keeps data: it is skipped when the job is private.
  */
@@ -340,7 +340,7 @@ export const afterZeroByte = (route: { cli: string; model: string }, tried: read
 
 // ---------- OpenCode Zen free models: the tracker's healthy list becomes the automatic route order ----------
 /**
- * The free models tried first: DeepSeek V4.1 Flash, then MiMo, Nemotron, Laguna, LongCat and GLM
+ * The free models the owner wants first (10/22): DeepSeek V4.1 Flash, then MiMo, Nemotron, Laguna, LongCat and GLM
  * 5.3 Flash. A pattern matches anywhere in the id, so a new version of a family still lands in its place; the rest
  * follows by id. Laguna is kept for when Zen offers it again.
  */
