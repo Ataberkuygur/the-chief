@@ -22,7 +22,7 @@ import type { CheckResult, Credit, LaneState, LaneTemplate } from './lanes'
 import { collectZen, emptyZen, healthyZenIds, zenDue, zenTrusted } from './zen'
 import type { ZenRecord, ZenResponse } from './zen'
 import { bootGateLive, criticalKill, gatePlan, suspendPs } from './heavygate'
-import { pruneStore, storeSet } from './storekeep'
+import { BULKY, kvName, pruneStore, storeSet as storeSetRaw } from './storekeep'
 import type { GateWait } from './heavygate'
 import { PROCSNAP_CS, PROCSNAP_VERSION, parseSnap, parseTasklist } from './procsnap'
 import type { SnapProc } from './procsnap'
@@ -4464,6 +4464,43 @@ async function hqDir($: $T) {
   return hqRoot
 }
 
+/** A store read that finds bulky keys (storekeep BULKY) in their own hq file; one not moved yet still comes from the store. */
+async function kvGet($: $T, key: string): Promise<unknown> {
+  if (!BULKY.test(key)) return $.store.get(key)
+  const file = join(await hqDir($), kvName(key))
+  for (let i = 0; i < 2 && (await $.fs.exists(file).catch(() => false)); i++) {
+    try {
+      return JSON.parse(await $.fs.read(file))
+    } catch {
+      await $.clock.sleep(150) // another chat is writing it: read once more
+    }
+  }
+  return $.store.get(key)
+}
+
+/** storekeep's storeSet (unchanged values are not written), with bulky keys written to their hq file and dropped from the store. */
+async function storeSet($: $T, key: string, value: unknown): Promise<void> {
+  if (!BULKY.test(key)) return storeSetRaw($, key, value)
+  const file = join(await hqDir($), kvName(key))
+  if (value === undefined) await removeFiles($, [file]).catch(() => false)
+  else await $.fs.write(file, JSON.stringify(value))
+  if ((await $.store.get(key).catch(() => undefined)) !== undefined) await $.store.delete(key).catch(() => undefined)
+}
+
+/** Moves bulky keys still in the store to their hq files (any chat may do it; the same value lands twice at worst). */
+async function moveBulky($: $T): Promise<number> {
+  let moved = 0
+  for (const key of await $.store.keys()) {
+    if (!BULKY.test(key)) continue
+    const file = join(await hqDir($), kvName(key))
+    const value = await $.store.get(key).catch(() => undefined)
+    if (value !== undefined && !(await $.fs.exists(file).catch(() => false))) await $.fs.write(file, JSON.stringify(value))
+    await $.store.delete(key).catch(() => undefined)
+    moved++
+  }
+  return moved
+}
+
 /** Reads a small text file through the shell (plugins have no file read of their own). */
 async function readText($: $T, path: string): Promise<string> {
   try {
@@ -4657,12 +4694,25 @@ async function procsnapExe($: $T): Promise<string | null> {
  * The machine's processes on Windows, never through WMI (owner's ban after 19.10): procsnap.exe, else tasklist (ids and
  * names only). Null when neither answers.
  */
+/** How old a process list another chat took may be and still serve (21.11: every chat ran procsnap every 8 s, ~1/s with 8 chats). */
+const SNAP_SHARE_MS = 4000
 async function snapshot($: $T): Promise<{ freeMb: number; procs: SnapProc[]; full: boolean } | null> {
   const exe = await procsnapExe($)
   if (exe) {
+    const shared = join(await hqDir($), 'procsnap-last.txt')
+    const now = await $.clock.now()
+    const cached = await $.fs.read(shared).catch(() => '')
+    const cut = cached.indexOf('\n')
+    if (cut > 0 && now - Number(cached.slice(0, cut)) < SNAP_SHARE_MS) {
+      const snap = parseSnap(cached.slice(cut + 1))
+      if (snap && snap.procs.length >= 10) return { ...snap, full: true }
+    }
     const r = await $.process.run([exe], { timeoutMs: 15000 }).catch(() => null)
     const snap = r && r.exitCode === 0 ? parseSnap(r.stdout) : null
-    if (snap) return { ...snap, full: true }
+    if (snap) {
+      await $.fs.write(shared, `${await $.clock.now()}\n${r!.stdout}`).catch(() => undefined)
+      return { ...snap, full: true }
+    }
   }
   const t = await $.process.run(['tasklist', '/FO', 'CSV', '/NH'], { timeoutMs: 15000 }).catch(() => null)
   const procs = t && t.exitCode === 0 ? parseTasklist(t.stdout) : []
@@ -5832,7 +5882,7 @@ async function settleIdentityOnce($: $T) {
   else if (Object.keys(chiefConfig).length) await storeSet($, `chiefConfig:${sid}`, chiefConfig)
   await update($, tick, n => (n ?? 0) + 1)
   // the leader's chief news lives under the app id too: what came before this reopen is kept
-  const keptLog = await $.store.get(`leaderLog:${app}`)
+  const keptLog = await kvGet($, `leaderLog:${app}`)
   if (Array.isArray(keptLog) && keptLog.length) {
     const seen = new Set(leaderLog.map(x => `${x.at}|${x.from}|${x.line}`))
     leaderLog = [...(keptLog as typeof leaderLog).filter(x => !seen.has(`${x.at}|${x.from}|${x.line}`)), ...leaderLog].sort((a, b) => a.at - b.at).slice(-200)
@@ -5906,7 +5956,7 @@ export function externalAgents(procs: readonly { pid: number; ppid: number; name
 }
 async function scanExternalAgents($: $T) {
   const now = await $.clock.now()
-  if (now - extScanAt < 8000 || !isWindows()) return
+  if (now - extScanAt < 20000 || !isWindows()) return
   extScanAt = now
   const mine = [engineSid, sid].filter(Boolean)
   if (!mine.length) return
@@ -7193,7 +7243,7 @@ function portsOf($: $T): Ports {
   return {
     now: () => $.clock.now(),
     sleep: ms => $.clock.sleep(ms),
-    get: key => $.store.get(key),
+    get: key => kvGet($, key),
     set: async (key, value) => {
       await storeSet($, key, value)
     },
@@ -7400,7 +7450,7 @@ export function releasable(c: { done?: boolean; unverified?: boolean; busy?: boo
 async function successorRunning($: $T, newSid: string): Promise<boolean> {
   if (!newSid) return false
   // the successor read its handoff record and started (the same record the old chat waited on)
-  const inb = (await $.store.get(`handoffIn:${newSid}`).catch(() => undefined)) as HandoffIn | undefined
+  const inb = (await kvGet($, `handoffIn:${newSid}`).catch(() => undefined)) as HandoffIn | undefined
   if (inb && inb.startedAt > 0) return true
   const path = join(await hqDir($), 'sessions', `${newSid}.json`)
   if (!(await fileExists($, path))) return false
@@ -7495,7 +7545,7 @@ function flowPortsOf($: $T): FlowPorts {
       await storeSet($, `handoffFile:${sid}`, { path, text: await readText($, path), at: await $.clock.now() })
     },
     open: (inb, again) => openHandoffSession($, inb, again),
-    started: async id => (((await $.store.get(`handoffIn:${id}`)) as HandoffIn | undefined)?.startedAt ?? 0) > 0,
+    started: async id => (((await kvGet($, `handoffIn:${id}`)) as HandoffIn | undefined)?.startedAt ?? 0) > 0,
     verify: newSid => successorRunning($, newSid),
     moved: async (title, newSid) => {
       if (leaderSid) await sendTo($, leaderSid, 'report', { line: L(`${title} handed off → ${newSid}`, `${title} devredildi → ${newSid}`), moved: sid })
@@ -7603,7 +7653,7 @@ async function handoffCheck($: $T) {
 /** The successor of a handoff takes what the old one left: role, model, effort, title, pin, then its first message. */
 async function takeHandoffIn($: $T) {
   for (const id of new Set([sid, engineSid, handoffToken].filter(Boolean))) {
-    const rec = (await $.store.get(`handoffIn:${id}`)) as HandoffIn | undefined
+    const rec = (await kvGet($, `handoffIn:${id}`)) as HandoffIn | undefined
     if (!rec || rec.taken) continue
     // taken first: an undo or a redo that brings this back finds it done
     await storeSet($, `handoffIn:${id}`, { ...rec, taken: true })
@@ -7632,7 +7682,7 @@ async function takeHandoffIn($: $T) {
 /** This session's first turn has begun: the old session is waiting to hear it. */
 async function markHandoffStarted($: $T) {
   if (!handoffIn) return
-  const rec = (await $.store.get(`handoffIn:${handoffIn.id}`)) as HandoffIn | undefined
+  const rec = (await kvGet($, `handoffIn:${handoffIn.id}`)) as HandoffIn | undefined
   if (rec && !rec.startedAt) await storeSet($, `handoffIn:${handoffIn.id}`, { ...rec, startedAt: await $.clock.now() })
 }
 
@@ -9456,6 +9506,8 @@ export const register: Register = (on, options) => {
     // keys of chats gone for 14 days (the store was 5600 keys / 2.6 MB of 4 MiB on 21.11); one chat an hour does it
     $.clock.every(60 * 60000, () => void (interactive && !isWorker ? pruneOld($).catch(() => undefined) : undefined))
     void $.clock.sleep(60000).then(() => (interactive && !isWorker ? pruneOld($) : undefined)).catch(() => undefined)
+    // logs, reports and handoff texts left in the store by an older version go to their hq files (storekeep BULKY)
+    void $.clock.sleep(20000).then(() => (interactive && !isWorker ? moveBulky($) : 0)).then(n => { if (n) $.ui.log(L(`The Chief: moved ${n} big store keys to files.`, `The Chief: ${n} büyük depo kaydı dosyaya taşındı.`)) }).catch(() => undefined)
     // detached jobs this chat started: told when they end; the leader runs the merge train
     $.clock.every(15000, () => void (!isWorker ? pollJobs($).catch(() => undefined) : undefined))
     let trainBusy = false
@@ -9561,7 +9613,7 @@ export const register: Register = (on, options) => {
     await registerChiefTools($)
     mainGoalId = String((await $.store.get('mainGoal')) ?? '')
     quiet = (await $.store.get(`quiet:${sid}`)) === true
-    const storedModels = await $.store.get('modelCache')
+    const storedModels = await kvGet($, 'modelCache')
     if (storedModels && typeof storedModels === 'object') modelCache = storedModels as ModelCache
     const storedOverrides = await $.store.get('optOverrides')
     if (storedOverrides && typeof storedOverrides === 'object') optOverrides = storedOverrides as Record<string, string>
@@ -9570,7 +9622,7 @@ export const register: Register = (on, options) => {
     leaderLanes = Array.isArray(storedLeaderLanes) && storedLeaderLanes.length ? (storedLeaderLanes as LeaderLane[]) : [defaultLeaderLane()]
     const storedPending = await $.store.get(`pendingOverviews:${sid}`)
     pendingOverviews = Array.isArray(storedPending) ? (storedPending as typeof pendingOverviews) : []
-    const storedLog = await $.store.get(`leaderLog:${sid}`)
+    const storedLog = await kvGet($, `leaderLog:${sid}`)
     leaderLog = Array.isArray(storedLog) ? (storedLog as typeof leaderLog) : []
     const held = await $.state.get(LANES)
     if (held.version === 0) {
@@ -9586,7 +9638,7 @@ export const register: Register = (on, options) => {
       }
       const storedStamps = await $.store.get(`dayStamps:${sid}`)
       dayStamps = storedStamps && typeof storedStamps === 'object' ? (storedStamps as Record<string, number>) : {}
-      const storedReports = await $.store.get('reports')
+      const storedReports = await kvGet($, 'reports')
       await $.state.set(REPORTS, Array.isArray(storedReports) ? (storedReports as SquadReport[]) : [])
     }
     void dailyCheck($).catch(() => undefined)

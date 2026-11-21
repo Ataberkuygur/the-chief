@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { prunePlan, sidOf, storeSet } from './storekeep'
+import { BULKY, kvName, prunePlan, sidOf, storeSet } from './storekeep'
 
 const A = '11111111-2222-3333-4444-555555555555'
 const B = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -45,4 +45,11 @@ test('prunePlan: drops every key of a session not seen for the age limit, keeps 
     expect(prunePlan(e, now, 14 * DAY).sort()).toEqual([`act:${A}:rc`, `lastTurnEnd:${A}`, `role:${A}`].sort())
     expect(sidOf(`act:${A}:rc`)).toBe(A)
     expect(sidOf('walm:abc')).toBeNull()
+})
+
+test('logs, reports, handoff texts and model lists go to their own hq file; small state stays in the store', () => {
+  for (const k of [`leaderLog:${A}`, `handoffFile:${A}`, `handoffIn:${A}`, 'housekeeping:log', 'reports', 'modelCache']) expect(BULKY.test(k)).toBe(true)
+  for (const k of [`role:${A}`, `chiefConfig:${A}`, 'mainGoal', 'reportsSeen', 'modelCacheAt', `act:${A}:rc`]) expect(BULKY.test(k)).toBe(false)
+  expect(kvName(`leaderLog:${A}`)).toBe(`kv-leaderLog_${A}.json`)
+  expect(kvName('housekeeping:log')).toBe('kv-housekeeping_log.json')
 })

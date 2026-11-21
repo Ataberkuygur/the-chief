@@ -16,6 +16,16 @@ export async function storeSet($: StoreLike, key: string, value: unknown): Promi
   return $.store.set(key, value)
 }
 
+/**
+ * Keys whose values are big or keep growing (logs, reports, handoff texts, the model lists). The host re-reads the
+ * whole shared store several times a second in every open chat (21.11: ~3.5x/s per chat, no plugin write needed), so
+ * these live in their own file under hq instead (`kvName`); the store keeps only small state.
+ */
+export const BULKY = /^(leaderLog:|handoffFile:|handoffIn:|housekeeping:log$|reports$|modelCache$)/
+
+/** The hq file name of a bulky key. Pure. */
+export const kvName = (key: string): string => `kv-${key.replace(/[^A-Za-z0-9._-]/g, '_')}.json`
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** The session id a key belongs to (`prefix:<uuid>` or `prefix:<uuid>:more`), else null. Pure. */
