@@ -3805,6 +3805,7 @@ async function capRead($: $T, e: { file_path: string; offset?: number; limit?: n
 
 /** After a turn of the chat itself: past the guard, compact now, while nothing is running, never mid-task. */
 async function contextGuard($: $T) {
+  if (!budget().guardTokens) return
   await $.clock.sleep(1500)
   // a handoff is writing its file: compacting now would only undo what it is saving
   if (handoffRunning) return
@@ -3830,7 +3831,8 @@ async function idleGuard($: $T) {
   if (!lastTurnEndAt || now - lastTurnEndAt > COLD_WINDOW_MS || now - lastTurnEndAt < 20_000) return
   // an idle chief compacts itself 50 minutes after its last turn, while its prompt cache is still warm
   if (await idleCompact($, now)) return
-  if ((await contextTokens($).catch(() => 0)) < budget().guardTokens) return
+  // context_guard off (0): nothing to check, and no transcript read or store write each minute
+  if (!budget().guardTokens || (await contextTokens($).catch(() => 0)) < budget().guardTokens) return
   await contextGuard($)
 }
 

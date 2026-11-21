@@ -13,7 +13,7 @@ function memStore(init: Record<string, unknown> = {}) {
     writes: () => writes,
     store: {
       get: async (k: string) => m.get(k),
-      set: async (k: string, v: unknown) => { writes++; m.set(k, JSON.parse(JSON.stringify(v))) },
+      set: async (k: string, v: unknown) => { writes++; if (v === undefined) m.delete(k); else m.set(k, JSON.parse(JSON.stringify(v))) },
       delete: async (k: string) => { m.delete(k) },
       keys: async () => [...m.keys()],
     },
@@ -28,6 +28,10 @@ test('storeSet: skips an unchanged value and writes a changed one', async () => 
     expect($.writes()).toBe(1)
     await storeSet($, 'new', 0)
     expect($.writes()).toBe(2)
+    await storeSet($, 'missing', undefined)
+    expect($.writes()).toBe(2)
+    await storeSet($, 'new', undefined)
+    expect($.writes()).toBe(3)
 })
 
 test('prunePlan: drops every key of a session not seen for the age limit, keeps live and unknown ones', () => {

@@ -10,10 +10,9 @@ type StoreLike = { store: { get(key: string): Promise<unknown>; set(key: string,
 
 /** `$.store.set` that skips a write when the stored value is already the same JSON. */
 export async function storeSet($: StoreLike, key: string, value: unknown): Promise<void> {
-  if (value !== undefined) {
-    const cur = await $.store.get(key)
-    if (cur !== undefined && JSON.stringify(cur) === JSON.stringify(value)) return
-  }
+  const cur = await $.store.get(key)
+  // removing a key that is not there is no change either
+  if (value === undefined ? cur === undefined : cur !== undefined && JSON.stringify(cur) === JSON.stringify(value)) return
   return $.store.set(key, value)
 }
 
