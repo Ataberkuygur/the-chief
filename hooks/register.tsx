@@ -6303,12 +6303,19 @@ async function lostRuns($: $T) {
   if (role !== 'leader' || isWorker) return
   const now = await $.clock.now()
   const all = ((await $.store.get('runs')) as RunRecord[] | undefined) ?? []
+  const told: string[] = []
   for (const rec of all) {
     if (rec.owner === sid || runs.has(rec.workerId)) continue
     const owner = hqCards.find(c => c.sid === rec.owner)
     if (owner && now - owner.updatedAt < 3 * 60000) continue // its owner is alive and follows it
     if ((await $.fs.exists(rec.exit)) || (await pidAlive($, rec.pid))) continue
+    told.push(rec.workerId)
     raise(`lost:${rec.workerId}`, L(`! worker lost: ${rec.runDir.split(/[\\/]/).filter(Boolean).pop() ?? rec.workerId} (pid ${rec.pid}) died without an exit code or report${owner ? `; owner ${titleOf(owner)}` : ''}`, `! işçi kayboldu: ${rec.runDir.split(/[\\/]/).filter(Boolean).pop() ?? rec.workerId} (pid ${rec.pid}) çıkış kodu / rapor bırakmadan öldü${owner ? `; sahibi ${titleOf(owner)}` : ''}`), true, now, 300)
+  }
+  // told once, then forgotten: the record of a dead run with no live owner would bring the same alert back after every reload
+  if (told.length) {
+    const fresh = ((await $.store.get('runs')) as RunRecord[] | undefined) ?? []
+    await storeSet($, 'runs', fresh.filter(r => !told.includes(r.workerId)))
   }
 }
 /** A build lock directory (train config `lock`) with no `owner` file for 30 minutes is a stale one; told to the leader (list_chiefs news). */
