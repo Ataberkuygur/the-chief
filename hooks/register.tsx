@@ -6403,7 +6403,8 @@ export const LEADER_CRON_DENY_EN = 'The leader wakes on events: a chief\'s quest
 export const LEADER_CRON_DENY = 'Lider olay tabanlı uyanır: bir şefin sorusu, kararı, hatası ya da train sonucu bu sohbeti kendisi başlatır. Yedek kontrol en sık 30 dakikada bir olabilir.'
 /** A leader's timer prompt with nothing new since its last turn (no alert waiting, a turn within 30 minutes): not a turn. */
 export const idleLeaderWake = (o: { origin: string; alerts: number; now: number; lastTurnEnd: number }) =>
-  o.origin === 'scheduled-trigger' && o.alerts === 0 && o.lastTurnEnd > 0 && o.now - o.lastTurnEnd < LEADER_WAKE_MIN * 60000
+  // 21.11 owner: no backup wake-ups at all; a timer prompt with no alert waiting is dropped (each one re-read the whole chat, cache cold)
+  o.origin === 'scheduled-trigger' && o.alerts === 0
 export const OWNER_BLOCK_DENY_EN = 'You are waiting for the owner\'s decision: set no wake-up, end this turn. This chat starts by itself when a decision or a new message arrives.'
 export const OWNER_BLOCK_DENY = 'Sahibinin kararını bekliyorsun: uyanma kurma, bu turu bitir. Karar ya da yeni bir mesaj gelince bu sohbet kendiliğinden başlar.'
 /** When this chat last ended a turn blocked on its owner; 0 once any message (not a wake) came. */
@@ -9932,7 +9933,7 @@ export const register: Register = (on, options) => {
       $.ui.log(`The Chief: /loop set to every ${LOOP_DEFAULT_S / 60} min (the prompt cache lives one hour; a later wake-up rewrites the whole history).`)
       e = { ...e, text: loop }
     }
-    if (role === 'leader' && idleLeaderWake({ origin: e.origin.kind, alerts: alerts.length, now: await $.clock.now(), lastTurnEnd: lastTurnEndAt })) return { drop: L('The Chief: skipped an empty leader wake-up (no new event; backup check every 30 min).', 'The Chief: boş lider uyanması atlandı (yeni olay yok; yedek kontrol 30 dk).') }
+    if (role === 'leader' && idleLeaderWake({ origin: e.origin.kind, alerts: alerts.length, now: await $.clock.now(), lastTurnEnd: lastTurnEndAt })) return { drop: L('The Chief: skipped a leader wake-up with no new event (backup checks are off).', 'The Chief: yeni olay olmadan gelen lider uyanması atlandı (yedek kontrol kapalı).') }
     // a message from someone (the owner, another chat) ends a wait on the owner (a leader's message, where it is
     // delivered); a wake-up, a scheduled trigger, a task notice or The Chief's own nudge does not
     if (e.text.trim() && !e.text.startsWith(WAKE) && ['composer', 'bridge', 'sdk', 'peer', 'peer-send-message'].includes(e.origin.kind)) ownerBlockedAt = 0
