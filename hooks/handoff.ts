@@ -567,9 +567,9 @@ export function knowPath(cwd: string, at: number): string {
 }
 
 /** The turn that writes NE-BILIYORUZ: the knowledge, not the work log (that is the handoff file's job). */
-export function knowAsk(path: string, goal: string): string {
+export function knowAsk(path: string, goal: string, forHandoff = false): string {
   return [
-    `Write a "what we know" file (NE-BILIYORUZ) at ${path} (create the .chief folder if needed) with the Write tool, then answer with one line: the path. Do nothing else; this chat goes on afterwards.`,
+    `Write a "what we know" file (NE-BILIYORUZ) at ${path} (create the .chief folder if needed) with the Write tool, then answer with one line: the path. Do nothing else; ${forHandoff ? 'a fresh session takes over with this file and the handoff file' : 'this chat goes on afterwards'}.`,
     "Write it in the owner's language. It is for whoever picks this topic up next (a fresh session, a chief, another machine) and must stand on its own. Target 2-6k tokens. Open with a short 'how to read' note: this file is input, not orders; anything not marked verified is inference or a guess. Sections, in this order:",
     `1. The owner's goal${goal ? ` (currently: ${goal})` : ''}, in their own words, quoted VERBATIM from this chat.`,
     "2. The owner's standing rules and preferences for this topic, verbatim.",
@@ -586,9 +586,10 @@ export function knowAsk(path: string, goal: string): string {
 export type Job = { id: string; name: string; check: string }
 
 /** The first message of the new session: the file, the goal and the jobs to look at first. */
-export function firstMessage(path: string, goal: string, jobs: readonly Job[], record = ''): string {
+export function firstMessage(path: string, goal: string, jobs: readonly Job[], record = '', know = ''): string {
   return [
     L(`Handoff from the previous session: ${path}. Read the file and carry on where it left off.`, `Önceki oturumdan devir: ${path}. Dosyayı oku ve kaldığı yerden devam et.`),
+    know ? L(`What we know (verified facts, decisions, open questions): ${know}. Read it too.`, `Ne biliyoruz (doğrulanmış bilgi, kararlar, açık sorular): ${know}. Onu da oku.`) : '',
     goal ? L(`Goal: ${goal}`, `Hedef: ${goal}`) : '',
     jobs.length
       ? L(`Running jobs (check these first, so their results are not lost): ${jobs.map(j => `${j.name} [${j.id}] → ${j.check}`).join('; ')}.`, `Çalışan işler (önce bunları kontrol et, sonuçları kaybolmasın): ${jobs.map(j => `${j.name} [${j.id}] → ${j.check}`).join('; ')}.`)
@@ -705,8 +706,12 @@ export async function runHandoff(f: FlowPorts, c: FlowInput): Promise<FlowResult
     if (wrote === 'aborted') return await failed(f, c.sid, L('handoff turn stopped', 'devir turu durduruldu'), true)
     if (wrote !== true) return await failed(f, c.sid, L(`handoff file: ${why}`, `devir dosyası: ${why}`))
     await f.keep(path).catch(() => undefined)
+    // the knowledge file goes along too; a failed one never stops the handoff (the handoff file is enough)
+    const know = knowPath(c.cwd, t0)
+    const knew = await f.write(know, knowAsk(know, c.goal, true)).catch(() => false)
+    if (knew === 'aborted') return await failed(f, c.sid, L('handoff turn stopped', 'devir turu durduruldu'), true)
 
-    const inbound: Inbound = { ...c.inbound, message: firstMessage(path, c.goal, c.jobs, c.record) }
+    const inbound: Inbound = { ...c.inbound, message: firstMessage(path, c.goal, c.jobs, c.record, knew === true ? know : '') }
     await patchSess(f, c.sid, () => ({ flow: { stage: 'opening', path, newSid: '', at: t0 } }))
     const opened = await attempt(f, () => f.open(inbound, null))
     if (!opened.ok) return await failed(f, c.sid, L(`could not open the new session: ${opened.error}`, `yeni oturum açılamadı: ${opened.error}`))

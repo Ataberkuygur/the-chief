@@ -7523,7 +7523,8 @@ async function doHandoff($: $T) {
     permission: await permissionModeOf($),
     dir: cwd,
     title,
-    pinned: await hasDone(p, sid, 'pin'),
+    // 21.11 owner: the new session of a handoff is always pinned (same name, the old one archived)
+    pinned: true,
     remote: await hasDone(p, sid, 'rc'),
     fromSid: sid,
     chief: chiefOf(),
