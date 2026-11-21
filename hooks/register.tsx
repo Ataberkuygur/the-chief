@@ -21,7 +21,7 @@ import { ESCALATE_AFTER, capacity, checkTable, creditLine, escalate, flowText, h
 import type { CheckResult, Credit, LaneState, LaneTemplate } from './lanes'
 import { collectZen, emptyZen, healthyZenIds, zenDue, zenTrusted } from './zen'
 import type { ZenRecord, ZenResponse } from './zen'
-import { bootGateLive, criticalKill, gatePlan, suspendPs } from './heavygate'
+import { bootGateLive, criticalKill, gatePlan, isAsr, suspendPs } from './heavygate'
 import { BULKY, kvName, pruneStore, storeSet as storeSetRaw } from './storekeep'
 import type { GateWait } from './heavygate'
 import { PROCSNAP_CS, PROCSNAP_VERSION, parseSnap, parseTasklist } from './procsnap'
@@ -4823,7 +4823,7 @@ async function sweepOrphanOpencode($: $T): Promise<number[]> {
  * The machine's heavy-command gate (hooks/heavygate.ts), run by one chat at a time: the one that refreshed
  * hq/heavy-gate.lock in the last 20 s. It holds agent workers' tsc / vitest / dependency-cruiser beyond the RAM slots.
  */
-const GATE_V = 2
+const GATE_V = 3
 /** Free RAM under which the gate ends one heavy tree a step (ram-guard.ps1 used 1.8 GB too). */
 const GATE_CRIT_MB = 1800
 async function heavyGateTick($: $T): Promise<void> {
@@ -4845,13 +4845,18 @@ async function heavyGateTick($: $T): Promise<void> {
   // free RAM and every process with its command line, from procsnap (no WMI); the tasklist fallback cannot tell builds apart
   const snap = await snapshot($)
   if (!snap?.full) return
-  const state = (await $.fs.exists(stateFile)) ? (JSON.parse(await $.fs.read(stateFile).catch(() => 'null')) as { waiting?: GateWait[] } | null) : null
+  const state = (await $.fs.exists(stateFile)) ? (JSON.parse(await $.fs.read(stateFile).catch(() => 'null')) as { waiting?: GateWait[]; waitingAsr?: GateWait[] } | null) : null
   // the build lock (train config `lock`): its holder is never held, or everyone waiting on the lock waits behind it
   const lockDir = (await readJson<{ lock?: string }>($, join(dir, 'train', 'config.json')))?.lock
   const lockSt = lockDir ? await $.fs.stat(lockDir).catch(() => null) : null
   const plan = gatePlan(snap.procs, state?.waiting ?? [], { freeMb: snap.freeMb, reserveMb: Math.max(4096, ramReserveMb()), slotMb: 3500, maxSlots: 1, now, maxWaitMs: 30 * 60000, lockAt: lockSt?.mtimeMs })
-  if (plan.suspend.length) await $.process.run(['powershell', '-NoProfile', '-Command', suspendPs(plan.suspend, true)], { timeoutMs: 30000 }).catch(() => null)
-  if (plan.resume.length) await $.process.run(['powershell', '-NoProfile', '-Command', suspendPs(plan.resume, false)], { timeoutMs: 30000 }).catch(() => null)
+  // speech-recognition python has its own pool (3 at a time, 20 min at most held): tsc / vitest never wait behind it
+  const asr = gatePlan(snap.procs, state?.waitingAsr ?? [], { freeMb: snap.freeMb, reserveMb: Math.max(4096, ramReserveMb()), slotMb: 3000, maxSlots: 3, now, maxWaitMs: 20 * 60000, heavy: isAsr })
+  const suspendIds = [...plan.suspend, ...asr.suspend]
+  const resumeIds = [...plan.resume, ...asr.resume]
+  if (suspendIds.length) await $.process.run(['powershell', '-NoProfile', '-Command', suspendPs(suspendIds, true)], { timeoutMs: 30000 }).catch(() => null)
+  if (resumeIds.length) await $.process.run(['powershell', '-NoProfile', '-Command', suspendPs(resumeIds, false)], { timeoutMs: 30000 }).catch(() => null)
+  if (asr.suspend.length) raise('gate:asr', L(`RAM low (${snap.freeMb} MB free): ${asr.running} speech-recognition run(s) going, the rest wait`, `RAM az (${snap.freeMb} MB boş): ${asr.running} konuşma tanıma çalışıyor, kalanı bekliyor`), true, now, 300)
   // under 1.8 GB free a held build still holds its RAM: one heavy tree a step is ended (what ram-guard.ps1 did)
   // the logon task (scripts/ram-gate.ps1) does the same while it runs: two killers would end two trees
   const bootGate = await readJson<{ at?: number }>($, join(dir, 'ram-gate.json'))
@@ -4861,7 +4866,7 @@ async function heavyGateTick($: $T): Promise<void> {
     const victim = snap.procs.find(p => p.pid === kill[0])
     raise(`gate:kill:${kill[0]}`, L(`! RAM critical (${snap.freeMb} MB free): stopped ${oneLine(victim?.cmd ?? String(kill[0]), 120)}`, `! RAM kritik (${snap.freeMb} MB boş): ${oneLine(victim?.cmd ?? String(kill[0]), 120)} durduruldu`), true, now, 300)
   }
-  await $.fs.write(stateFile, JSON.stringify({ at: now, holder: sid, slots: plan.slots, running: plan.running, waiting: plan.next }))
+  await $.fs.write(stateFile, JSON.stringify({ at: now, holder: sid, slots: plan.slots, running: plan.running, waiting: plan.next, waitingAsr: asr.next }))
 }
 /** The agent itself and the helpers it keeps open the whole run (MCP and language servers): they say nothing about a command running now. */
 const HELPER_RE = /mcp|model-?context|language-?server|\blsp\b|tsserver|gopls|pyright|rust-analyzer|conhost|opencode|qodercli|claude|codex|devin|gemini|agy|cursor-agent/i

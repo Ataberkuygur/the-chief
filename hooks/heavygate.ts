@@ -34,6 +34,18 @@ export function personOwned(byId: Map<number, GateProc>, p: GateProc): boolean {
 export const isHeavy = (p: Pick<GateProc, 'name' | 'cmd'>) =>
   /^(node|bun)(\.exe)?$/i.test(p.name) && HEAVY_CMD_RE.test(p.cmd) && !NOT_HEAVY_RE.test(p.cmd)
 
+/** Speech-recognition python (the ASR venv, whisper, parakeet): one run holds ~2.5 GB. */
+const ASR_CMD_RE = /asr-venv|asr[-_]?worker|transcrib|whisper|parakeet/i
+/** The long-lived python servers that only look like it (the embedding host, MyWiki): never held. */
+const NOT_ASR_RE = /embed_worker|\bserve\b|mcp_stdio|MyWiki|server\.py/i
+/**
+ * Four of these at once (19:00-19:46 on 21.11.2026, with a dozen ffmpeg) took free RAM to 1.8 GB and the machine's
+ * Drive, sign-in and chats stopped answering. They get a pool of their own: a held ASR run only waits, and tsc / vitest
+ * are not held behind it. ffmpeg stays ungated (see the top).
+ */
+export const isAsr = (p: Pick<GateProc, 'name' | 'cmd'>) =>
+  /^python[\d.]*(\.exe)?$/i.test(p.name) && ASR_CMD_RE.test(p.cmd) && !NOT_ASR_RE.test(p.cmd)
+
 /** The ancestors of a process, nearest first (stops at a loop or a missing parent). */
 function ancestors(byId: Map<number, GateProc>, p: GateProc): GateProc[] {
   const out: GateProc[] = []
@@ -88,11 +100,12 @@ export type GatePlan = {
  * maxSlots. Too many running: the newest ones are held. Room: the oldest held ones go on. A command held
  * longer than maxWaitMs goes on anyway, so a hold never becomes a hang.
  */
-export function gatePlan(procs: readonly GateProc[], held: readonly GateWait[], o: { freeMb: number; reserveMb: number; slotMb: number; maxSlots: number; now: number; maxWaitMs: number; lockAt?: number }): GatePlan {
+export function gatePlan(procs: readonly GateProc[], held: readonly GateWait[], o: { freeMb: number; reserveMb: number; slotMb: number; maxSlots: number; now: number; maxWaitMs: number; lockAt?: number; heavy?: (p: GateProc) => boolean }): GatePlan {
+  const heavy = o.heavy ?? isHeavy
   const byId = new Map(procs.map(p => [p.pid, p]))
   const byParent = new Map<number, GateProc[]>()
   for (const p of procs) byParent.set(p.ppid, [...(byParent.get(p.ppid) ?? []), p])
-  const roots = procs.filter(p => isHeavy(p) && !ancestors(byId, p).some(isHeavy) && !personOwned(byId, p))
+  const roots = procs.filter(p => heavy(p) && !ancestors(byId, p).some(heavy) && !personOwned(byId, p))
   const info = new Map(roots.map(r => {
     const tree = treeOf(byParent, r)
     return [r.pid, { root: r, tree, mb: tree.reduce((s, id) => s + (byId.get(id)?.mb ?? 0), 0) }] as const

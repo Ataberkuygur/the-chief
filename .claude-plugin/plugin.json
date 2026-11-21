@@ -1,6 +1,6 @@
 {
   "name": "the-chief",
-  "version": "1.43.21",
+  "version": "1.43.22",
   "description": "The Chief: run agent squads from inside Claude Code. Per-task lanes (CLI, model, effort, agent count), a live view of every agent and subagent with stop and follow-up, Sonnet overviews kept by date with a day-end summary, and goals you start as /goal.",
   "author": {
     "name": "Ataberk Uygur"
